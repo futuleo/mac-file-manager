@@ -1,0 +1,11 @@
+instructions: |
+  Follow AGENTS.md, plan.md, and .github/AUTONOMY.md.
+  Keep writers and reviewers in separate sessions.
+  Set the user-selected model explicitly when launching a role:
+  writer claude-sonnet-5.5, reviewer gpt-6.1-sol, test runner claude-haiku-5.5.
+  Never let a writer publish its own independent-review status.
+  Never push directly to main or bypass protection.
+  Merge only through scripts/merge-reviewed-pr.mjs after exact-head and exact-base gates pass.
+automation:
+  auto_issue_session: false
+  remote_control: false

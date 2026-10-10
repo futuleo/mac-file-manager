@@ -1,0 +1,165 @@
+import { describe, expect, it } from "vitest";
+import type { FileEntry } from "../backend/contracts";
+import * as hist from "./history";
+import { ancestors, parentOf } from "./path";
+import { defaultPreferences, parsePreferences } from "./preferences";
+import { emptySelection, extendTo, invert, move, prune, selectAll, selectOnly, toggle } from "./selection";
+import { formatEntrySize, nextSort, sortEntries, typeLabel } from "./sort";
+import { initialTabsState, MAX_TABS, tabsReducer, type TabsState } from "./tabs";
+import { scrollTopFor, visibleRange } from "./virtual";
+
+const hex = (path: string) => Array.from(new TextEncoder().encode(path), (b) => b.toString(16).padStart(2, "0")).join("");
+const loc = (path: string) => ({ id: hex(path), path, name: path.slice(path.lastIndexOf("/") + 1) || "/" });
+const file = (name: string, over: Partial<FileEntry> = {}): FileEntry => ({
+  id: hex(`/d/${name}`), path: `/d/${name}`, name, kind: "file", size: 1, modifiedMs: 1, isSymlink: false, isBrokenLink: false, ...over,
+});
+
+describe("path", () => {
+  it("derives breadcrumbs from raw bytes, including non-UTF-8 ids", () => {
+    expect(ancestors(loc("/Users/me")).map((l) => l.name)).toEqual(["/", "Users", "me"]);
+    expect(parentOf(loc("/Users/me"))?.id).toBe(hex("/Users"));
+    expect(parentOf(loc("/"))).toBeNull();
+    const odd = { id: "2f61ff", path: "/a\ufffd", name: "a\ufffd" }; // /a<0xff>
+    expect(ancestors(odd)).toHaveLength(2);
+    expect(ancestors({ id: "zz", path: "x", name: "x" })).toHaveLength(1);
+  });
+});
+
+describe("history", () => {
+  it("ignores same-location pushes and truncates forward entries", () => {
+    let h = hist.push(hist.emptyHistory, loc("/a"));
+    h = hist.push(h, loc("/a"));
+    expect(h.items).toHaveLength(1);
+    h = hist.push(hist.push(h, loc("/b")), loc("/c"));
+    h = hist.back(hist.back(h));
+    expect(hist.canGoForward(h)).toBe(true);
+    h = hist.push(h, loc("/d"));
+    expect(h.items.map((l) => l.path)).toEqual(["/a", "/d"]);
+    expect(hist.canGoBack(hist.back(h))).toBe(false);
+  });
+});
+
+describe("sorting", () => {
+  const items = [
+    file("b.txt", { size: 5, modifiedMs: 10 }),
+    file("A.txt", { size: null, modifiedMs: null }),
+    file("a10.txt", { size: 5, modifiedMs: 20 }),
+    file("a2.txt", { size: 5, modifiedMs: 20 }),
+    file("dir", { kind: "directory", size: null }),
+  ];
+  const names = (key: Parameters<typeof nextSort>[1], direction: "asc" | "desc") =>
+    sortEntries(items, { key, direction }).map((e) => e.name);
+
+  it("groups folders first and compares names naturally", () => {
+    expect(names("name", "asc")).toEqual(["dir", "A.txt", "a2.txt", "a10.txt", "b.txt"]);
+  });
+  it("puts unknown values last in both directions and ties by name", () => {
+    expect(names("size", "asc").slice(-1)).toEqual(["A.txt"]);
+    expect(names("size", "desc").slice(-1)).toEqual(["A.txt"]);
+    expect(names("modified", "desc")).toEqual(["dir", "a2.txt", "a10.txt", "b.txt", "A.txt"]);
+    expect(formatEntrySize(items[1]!)).toBe("Unknown");
+  });
+  it("is deterministic regardless of input order and does not mutate", () => {
+    const reversed = [...items].reverse();
+    expect(sortEntries(reversed, { key: "type", direction: "asc" })).toEqual(sortEntries(items, { key: "type", direction: "asc" }));
+    expect(items[0]!.name).toBe("b.txt");
+  });
+  it("labels links and toggles direction", () => {
+    expect(typeLabel(file("x", { kind: "other", isSymlink: true, isBrokenLink: true }))).toContain("Broken");
+    expect(nextSort({ key: "name", direction: "asc" }, "name").direction).toBe("desc");
+  });
+});
+
+describe("selection", () => {
+  const rows = ["a", "b", "c", "d"].map((n) => file(n));
+  it("handles toggle, range, movement and select-all by identity", () => {
+    let s = toggle(selectOnly(rows[0]!.id), rows[2]!.id);
+    expect([...s.ids]).toEqual([rows[0]!.id, rows[2]!.id]);
+    s = extendTo(rows, selectOnly(rows[1]!.id), rows[3]!.id);
+    expect(s.ids.size).toBe(3);
+    s = move(rows, s, "up", true);
+    expect(s.ids.size).toBe(2);
+    expect(move(rows, emptySelection, "down", false).focus).toBe(rows[0]!.id);
+    expect(move(rows, selectOnly(rows[3]!.id), "down", false).focus).toBe(rows[3]!.id);
+    expect(move(rows, selectOnly(rows[0]!.id), { page: 10 }, false).focus).toBe(rows[3]!.id);
+    expect(selectAll(rows, emptySelection).ids.size).toBe(4);
+    expect(invert(rows, selectOnly(rows[0]!.id)).ids.size).toBe(3);
+  });
+  it("prunes vanished identities", () => {
+    const pruned = prune(selectAll(rows, emptySelection), rows.slice(0, 2));
+    expect(pruned.ids.size).toBe(2);
+    expect(pruned.focus).toBe(rows[0]!.id);
+  });
+});
+
+describe("virtual window", () => {
+  it("is bounded by the viewport, not the count", () => {
+    const r = visibleRange(24 * 5000, 600, 1_000_000);
+    expect(r.end - r.start).toBeLessThan(50);
+    expect(visibleRange(0, 600, 3)).toEqual({ start: 0, end: 3 });
+    expect(scrollTopFor(100, 0, 240)).toBe(100 * 24 + 24 - 240);
+    expect(scrollTopFor(1, 0, 240)).toBe(0);
+  });
+});
+
+describe("preferences", () => {
+  it("validates stored data and stores nothing else", () => {
+    expect(parsePreferences("not json")).toEqual(defaultPreferences);
+    const p = parsePreferences(JSON.stringify({ sort: { key: "evil", direction: "desc" }, showHidden: true, columns: { name: 1, modified: 99999 }, history: ["/secret"] }));
+    expect(p.sort).toEqual({ key: "name", direction: "desc" });
+    expect(p.columns.name).toBe(60);
+    expect(p.columns.modified).toBe(800);
+    expect(Object.keys(p).sort()).toEqual(["columns", "showHidden", "sort"]);
+  });
+});
+
+describe("tabs reducer", () => {
+  const open = (s: TabsState, path: string | null) => tabsReducer(s, { type: "open", location: path ? loc(path) : null });
+  const err = { category: "notFound" as const, operation: "x", context: null, message: "boom" };
+
+  it("keeps per-tab state independent and never closes the last tab", () => {
+    let s = open(open(initialTabsState, "/a"), "/b");
+    const [t1, t2] = s.tabs;
+    s = tabsReducer(s, { type: "navigate", tabId: t1!.id, location: loc("/c") });
+    expect(s.tabs[0]!.history.items).toHaveLength(2);
+    expect(s.tabs[1]!.history.items).toHaveLength(1);
+    s = tabsReducer(s, { type: "close", tabId: t2!.id });
+    expect(tabsReducer(s, { type: "close", tabId: t1!.id })).toBe(s);
+  });
+  it("ignores results from superseded navigations and closed tabs", () => {
+    let s = open(initialTabsState, "/a");
+    const id = s.tabs[0]!.id;
+    const stale = s.tabs[0]!.nav;
+    s = tabsReducer(s, { type: "navigate", tabId: id, location: loc("/b") });
+    const after = tabsReducer(s, { type: "entries", tabId: id, nav: stale, entries: [file("x")], failures: [] });
+    expect(after).toBe(s);
+    expect(tabsReducer(s, { type: "failed", tabId: id, nav: stale, error: err })).toBe(s);
+    expect(tabsReducer(s, { type: "finished", tabId: "tab-99", nav: 1 })).toBe(s);
+  });
+  it("guards address navigation with ifNav and a failure does not touch history", () => {
+    let s = open(initialTabsState, "/a");
+    const { id, nav } = s.tabs[0]!;
+    s = tabsReducer(s, { type: "address-error", tabId: id, error: err });
+    expect(s.tabs[0]!.history.items).toHaveLength(1);
+    s = tabsReducer(s, { type: "navigate", tabId: id, location: loc("/b") }); // newer navigation
+    const guarded = tabsReducer(s, { type: "navigate", tabId: id, location: loc("/c"), ifNav: nav });
+    expect(guarded).toBe(s);
+  });
+  it("marks failures and caps tab count", () => {
+    let s = open(initialTabsState, "/a");
+    const { id, nav } = s.tabs[0]!;
+    s = tabsReducer(s, { type: "failed", tabId: id, nav, error: err });
+    expect(s.tabs[0]!.listing.status).toBe("failed");
+    for (let i = 0; i < MAX_TABS + 3; i += 1) s = open(s, "/a");
+    expect(s.tabs).toHaveLength(MAX_TABS);
+  });
+  it("keeps selection on reload and clears it on a new folder", () => {
+    let s = open(initialTabsState, "/a");
+    const id = s.tabs[0]!.id;
+    s = tabsReducer(s, { type: "select", tabId: id, selection: selectOnly("x") });
+    s = tabsReducer(s, { type: "reload", tabId: id });
+    expect(s.tabs[0]!.selection.ids.has("x")).toBe(true);
+    s = tabsReducer(s, { type: "navigate", tabId: id, location: loc("/b") });
+    expect(s.tabs[0]!.selection.ids.size).toBe(0);
+  });
+});

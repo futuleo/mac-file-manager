@@ -1,0 +1,46 @@
+name: Validate
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: validate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    name: validate
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - name: Validate automation
+        run: |
+          node --test scripts/merge-reviewed-pr.test.mjs
+          ruby -ryaml -e 'ARGV.each { |p| YAML.load_file(p) }' .github/github-app.yml .github/workflows/validate.yml
+          git diff --check HEAD^ HEAD
+      - name: Validate application when scaffolded
+        run: |
+          if [ ! -f package.json ] && [ ! -f src-tauri/Cargo.toml ]; then
+            echo "Bootstrap only: no application exists; application checks are unavailable."
+            exit 0
+          fi
+          test -f package.json
+          test -f package-lock.json
+          test -f src-tauri/Cargo.toml
+          npm ci
+          npm run check
+          npm test
+          npm run build
+          cargo fmt --manifest-path src-tauri/Cargo.toml --check
+          cargo check --manifest-path src-tauri/Cargo.toml --locked
+          cargo test --manifest-path src-tauri/Cargo.toml --locked
+          npm run tauri build -- --no-bundle

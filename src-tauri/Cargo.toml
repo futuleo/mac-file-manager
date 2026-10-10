@@ -1,0 +1,36 @@
+[package]
+name = "mac-file-manager"
+version = "0.1.0"
+description = "Windows-10-style file manager for macOS"
+authors = []
+edition = "2024"
+rust-version = "1.90"
+
+[lib]
+name = "mac_file_manager_lib"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-app-kit = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-quick-look-ui = "0.3.2"
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
