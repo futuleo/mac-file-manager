@@ -134,7 +134,8 @@ only (API available), not exercised behavior; external dragging is untested.
   Holding the pointer near the top or bottom (or left/right) edge autoscrolls, faster the
   further out it is; only visible rows are mounted, so the rectangle is computed from row
   geometry and also selects rows scrolled past. Esc during a drag restores the selection
-  from before it. Releasing (even outside the window), losing window focus, another mouse
+  from before it and ends the rectangle (the rest of that press is ignored). Scrolling with a
+  wheel/trackpad under a held, stationary pointer re-evaluates the rectangle. Releasing (even outside the window), losing window focus, another mouse
   press, a refreshed/re-sorted list or new search results, closing the tab, or navigating ends
   the gesture without a stale rectangle; the selection keeps what it had. Keyboard focus
   moves to the row at the pointer end on release. Each tab keeps its own selection, and an

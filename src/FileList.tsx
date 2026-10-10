@@ -58,8 +58,13 @@ const AUTOSCROLL_MAX = 40;
 const AUTOSCROLL_TICK_MS = 16;
 
 interface MarqueeGesture {
-  /** Stops the gesture. `restore` puts the pre-gesture selection back; `commit` finalizes focus. */
-  end(how: "commit" | "restore" | "drop"): void;
+  /**
+   * `restore` puts the pre-gesture selection back but keeps the gesture until the button is released;
+   * `commit` finalizes focus and ends it (`released`: the mouse-up that follows a drag); `drop` just ends it.
+   */
+  end(how: "commit" | "restore" | "drop", released?: boolean): void;
+  /** Recomputes the rectangle after the list scrolled under a stationary pointer. */
+  refresh(): void;
 }
 
 interface MarqueeBox {
@@ -235,8 +240,11 @@ function FileList(props: Props) {
     let active = false;
     let latest = base;
     let far: string | null = null;
+    let cancelled = false;
+    suppressClick.current = false;
 
     const update = () => {
+      if (cancelled) return;
       const now = toContent(pointer.x, pointer.y);
       if (!active) {
         if (Math.hypot(now.x - origin.x, now.y - origin.y) < MARQUEE_THRESHOLD) return;
@@ -261,7 +269,7 @@ function FileList(props: Props) {
     };
 
     const autoscroll = () => {
-      if (!active) return;
+      if (!active || cancelled) return;
       const r = el.getBoundingClientRect();
       const top = r.top + HEADER_HEIGHT;
       const bottom = r.top + el.clientHeight;
@@ -285,14 +293,14 @@ function FileList(props: Props) {
     };
 
     const onMove = (e: MouseEvent) => {
-      if (e.buttons === 0) return end("commit"); // the release happened outside the window
+      if (e.buttons === 0) return end("commit", true); // the release happened outside the window
       pointer = { x: e.clientX, y: e.clientY };
       update();
     };
-    const onUp = () => end("commit");
+    const onUp = () => end("commit", true);
     const onDown = () => end("commit");
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+      if (e.key === "Escape" && !cancelled) {
         e.preventDefault();
         e.stopPropagation();
         end("restore");
@@ -301,8 +309,16 @@ function FileList(props: Props) {
     const onBlur = () => end("commit");
     const timer = window.setInterval(autoscroll, AUTOSCROLL_TICK_MS);
 
-    function end(how: "commit" | "restore" | "drop") {
+    function end(how: "commit" | "restore" | "drop", released = false) {
       if (gesture.current !== handle) return;
+      if (how === "restore") {
+        if (!active || cancelled) return;
+        cancelled = true;
+        active = false;
+        setMarquee(null);
+        onSelectRef.current(base);
+        return;
+      }
       gesture.current = null;
       window.clearInterval(timer);
       window.removeEventListener("mousemove", onMove);
@@ -310,21 +326,20 @@ function FileList(props: Props) {
       window.removeEventListener("mousedown", onDown, true);
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("blur", onBlur);
-      if (active) {
-        // The release after a drag must not count as a click on empty space.
+      setMarquee(null);
+      if (released && (active || cancelled)) {
+        // Only the click that this very release produces is swallowed, not later ones.
         suppressClick.current = true;
         window.setTimeout(() => {
           suppressClick.current = false;
         }, 0);
       }
-      setMarquee(null);
       if (how === "drop" || !active) return;
-      if (how === "restore") onSelectRef.current(base);
-      else if (far !== null && rowsRef.current.some((r) => r.id === far)) {
+      if (far !== null && rowsRef.current.some((r) => r.id === far)) {
         onSelectRef.current({ ...latest, focus: far });
       }
     }
-    const handle: MarqueeGesture = { end };
+    const handle: MarqueeGesture = { end, refresh: update };
     gesture.current = handle;
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -377,6 +392,7 @@ function FileList(props: Props) {
       const top = event.currentTarget.scrollTop;
       setScrollTop(top);
       props.onScrollTop(top);
+      gesture.current?.refresh();
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [props.onScrollTop],

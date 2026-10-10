@@ -263,4 +263,73 @@ describe("marquee selection", () => {
     });
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it("after Escape the held button's release and click neither clear nor replace the restored selection", () => {
+    vi.useFakeTimers();
+    for (const via of ["body", "row"] as const) {
+      cleanup();
+      mount(10, selectOnly(file(1).id));
+      const filler = screen.getByText("f5.txt").closest('[role="row"]')!.querySelector(".filler")!;
+      press(filler, 380, yOf(5));
+      move(380, yOf(8));
+      expect(selected()).toEqual(ids(5, 6, 7, 8));
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(selected()).toEqual(ids(1));
+      act(() => {
+        vi.advanceTimersByTime(5);
+      });
+      move(380, yOf(3)); // still held: a cancelled gesture does not resume
+      expect(selected()).toEqual(ids(1));
+      release();
+      const target = via === "body" ? grid().querySelector(".body")! : screen.getByText("f3.txt").closest('[role="row"]')!;
+      fireEvent.click(target);
+      expect(selected()).toEqual(ids(1));
+      act(() => {
+        vi.advanceTimersByTime(5);
+      });
+      fireEvent.click(screen.getByText("f3.txt")); // unrelated later click works
+      expect(selected()).toEqual(ids(3));
+    }
+  });
+
+  it("a later empty-space click after a completed drag is not swallowed", () => {
+    vi.useFakeTimers();
+    mount(10, selectOnly(file(1).id));
+    press(grid(), 300, yOf(9) + 40);
+    move(300, yOf(6));
+    release();
+    act(() => {
+      vi.advanceTimersByTime(5);
+    });
+    fireEvent.click(grid());
+    expect(selected()).toEqual([]);
+  });
+
+  it("recomputes the rectangle when the list scrolls under a stationary pointer", () => {
+    render(<Host rows={make(30)} />);
+    const el = grid();
+    fakeGeometry(el);
+    press(el, 300, yOf(5));
+    move(300, 223);
+    expect(selected()).toEqual(ids(5, 6, 7, 8));
+    fireEvent.scroll(el, { target: { scrollTop: 240 } });
+    expect(selected()).toEqual(ids(5, ...Array.from({ length: 13 }, (_, i) => i + 6)));
+    fireEvent.scroll(el, { target: { scrollTop: 0 } });
+    expect(selected()).toEqual(ids(5, 6, 7, 8));
+    release();
+  });
+
+  it("horizontal scroll with a stationary pointer keeps the gesture consistent and scroll after release is inert", () => {
+    render(<Host rows={make(30)} />);
+    const el = grid();
+    fakeGeometry(el);
+    press(el, 300, yOf(5));
+    move(300, yOf(7));
+    fireEvent.scroll(el, { target: { scrollLeft: 50 } });
+    expect(selected()).toEqual(ids(5, 6, 7));
+    release();
+    const before = changes.length;
+    fireEvent.scroll(el, { target: { scrollTop: 240 } });
+    expect(changes.length).toBe(before);
+  });
 });
