@@ -223,24 +223,40 @@ pub enum SearchMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SearchState {
+    /// The initial pass over the index is running; more results may arrive.
     Gathering,
+    /// The initial pass ended and the query still watches the index for changes.
     Live,
     Cancelled,
 }
 
+/// Search events are tagged with the caller's `search_id`. Every search ends
+/// with `Cancelled` (the caller cancelled) or `Failed`; otherwise it keeps
+/// reporting changes until cancelled. After a terminal event nothing follows.
+/// `Results` are upserts by `id` (a later entry replaces an earlier one).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum SearchEvent {
+    /// `skipped` counts Spotlight matches that were left out because the item
+    /// no longer exists or could not be examined (the index can be stale).
     #[serde(rename_all = "camelCase")]
     Results {
         search_id: String,
         entries: Vec<FileEntry>,
+        skipped: u64,
     },
+    /// Items that no longer match or no longer exist.
+    #[serde(rename_all = "camelCase")]
+    Removed { search_id: String, ids: Vec<String> },
     #[serde(rename_all = "camelCase")]
     State {
         search_id: String,
         state: SearchState,
     },
+    /// The result limit was reached: the query was stopped and no further
+    /// matches are delivered, so the list is incomplete by design.
+    #[serde(rename_all = "camelCase")]
+    Limited { search_id: String, limit: u64 },
     #[serde(rename_all = "camelCase")]
     Failed { search_id: String, error: AppError },
 }
@@ -405,6 +421,30 @@ mod tests {
         assert_eq!(value["affected"][0], "2f");
         assert_eq!(value["failed"][0]["error"]["category"], "permissionDenied");
         assert_eq!(serde_json::from_value::<TaskEvent>(value).unwrap(), event);
+
+        let results = SearchEvent::Results {
+            search_id: "s".into(),
+            entries: vec![],
+            skipped: 2,
+        };
+        let value = serde_json::to_value(&results).unwrap();
+        assert_eq!(value["type"], "results");
+        assert_eq!(value["searchId"], "s");
+        assert_eq!(value["skipped"], 2);
+        let removed = serde_json::to_value(SearchEvent::Removed {
+            search_id: "s".into(),
+            ids: vec!["61".into()],
+        })
+        .unwrap();
+        assert_eq!(removed["type"], "removed");
+        assert_eq!(removed["ids"][0], "61");
+        let limited = serde_json::to_value(SearchEvent::Limited {
+            search_id: "s".into(),
+            limit: 10,
+        })
+        .unwrap();
+        assert_eq!(limited["type"], "limited");
+        assert_eq!(limited["limit"], 10);
 
         let search = SearchEvent::State {
             search_id: "s".into(),

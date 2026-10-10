@@ -1,0 +1,268 @@
+// MOCKED IPC: `invoke` and `listen` are in-memory fakes of the backend. These tests verify how
+// the UI starts, cancels and renders searches and keeps them per tab; they do not prove real
+// Spotlight results, native menu delivery or WebView behavior.
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import App from "./App";
+import { DIRECTORY_EVENT, MENU_EVENT, SEARCH_EVENT } from "./backend/contracts";
+import type { FileEntry, SearchEvent } from "./backend/contracts";
+import { resetIconQueueForTests } from "./iconQueue";
+
+type Listener = (e: { payload: unknown }) => void;
+const mocks = vi.hoisted(() => ({
+  invoke: vi.fn(),
+  listeners: [] as { name: string; cb: (e: { payload: unknown }) => void }[],
+}));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async (name: string, cb: Listener) => {
+    const record = { name, cb };
+    mocks.listeners.push(record);
+    return () => {
+      mocks.listeners = mocks.listeners.filter((l) => l !== record);
+    };
+  }),
+}));
+
+const hex = (path: string) => Array.from(new TextEncoder().encode(path), (b) => b.toString(16).padStart(2, "0")).join("");
+function entry(path: string, over: Partial<FileEntry> = {}): FileEntry {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  return { id: hex(path), path, name, kind: "file", size: 10, modifiedMs: 1_700_000_000_000, isSymlink: false, isBrokenLink: false, ...over };
+}
+const dir = (path: string) => entry(path, { kind: "directory", size: null });
+const home = dir("/Users/me");
+const nested = entry("/Users/me/Docs/deep/report.txt");
+const deepDir = dir("/Users/me/Docs/deep");
+const direct = entry("/Users/me/report-direct.txt");
+const directRenamed = entry("/Users/me/budget-direct.txt");
+
+let reads: { readId: string; id: string }[] = [];
+let calls: { command: string; args: Record<string, unknown> }[] = [];
+let failCommand: Record<string, unknown> = {};
+
+const called = (command: string) => calls.filter((c) => c.command === command);
+const emitSearch = (event: SearchEvent) =>
+  act(() => {
+    for (const l of [...mocks.listeners]) if (l.name === SEARCH_EVENT) l.cb({ payload: event });
+  });
+const menu = (id: string) =>
+  act(() => {
+    for (const l of [...mocks.listeners]) if (l.name === MENU_EVENT) l.cb({ payload: id });
+  });
+const finishRead = (readId: string, entries: FileEntry[]) =>
+  act(() => {
+    for (const l of [...mocks.listeners]) {
+      if (l.name !== DIRECTORY_EVENT) continue;
+      l.cb({ payload: { type: "entries", readId, entries, failures: [] } });
+      l.cb({ payload: { type: "finished", readId, entries: entries.length, failed: 0 } });
+    }
+  });
+
+beforeEach(() => {
+  reads = [];
+  calls = [];
+  failCommand = {};
+  mocks.listeners = [];
+  localStorage.clear();
+  resetIconQueueForTests();
+  mocks.invoke.mockImplementation(async (command: string, args: Record<string, unknown>) => {
+    calls.push({ command, args });
+    if (command in failCommand) throw failCommand[command];
+    switch (command) {
+      case "get_platform_info": return { appVersion: "0", osVersion: "26", arch: "aarch64", deploymentTarget: "12.0", capabilities: { spotlightQuery: true, quickLookPanel: true, trash: true, systemIcons: true, dragSession: false } };
+      case "get_home_directory": return home;
+      case "list_places": return { places: [{ label: "Home", group: "quick", entry: home }], failures: [] };
+      case "start_directory_read":
+        reads.push({ readId: args.readId as string, id: args.id as string });
+        return undefined;
+      case "parent_directory": return (args.id as string) === home.id ? null : args.id === direct.id || args.id === directRenamed.id ? home : deepDir;
+      case "rename_item": return args.id === direct.id ? directRenamed : entry(`/Users/me/Docs/deep/${args.newName as string}`);
+      case "get_icon": throw new Error("no icon in tests");
+      default: return undefined;
+    }
+  });
+});
+afterEach(() => {
+  cleanup();
+  mocks.invoke.mockReset();
+});
+
+async function start() {
+  render(<App />);
+  await waitFor(() => expect(reads.length).toBe(1));
+  finishRead(reads[0]!.readId, [entry("/Users/me/a.txt")]);
+}
+const box = () => screen.getByLabelText("Search this folder") as HTMLInputElement;
+async function search(text: string) {
+  fireEvent.change(box(), { target: { value: text } });
+  fireEvent.keyDown(box(), { key: "Enter" });
+  await waitFor(() => expect(called("start_search").length).toBeGreaterThan(0));
+  return called("start_search")[called("start_search").length - 1]!.args as { searchId: string; scopeId: string; mode: string; query: string };
+}
+
+describe("search UI (mocked IPC)", () => {
+  it("searches the current folder by name, shows incremental results with their location, honest caveats", async () => {
+    await start();
+    const args = await search("report");
+    expect(args).toMatchObject({ scopeId: home.id, mode: "filename", query: "report" });
+    expect(screen.getByText(/Searching file names for “report”/)).toBeTruthy();
+    emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
+    expect(screen.getByText("report.txt")).toBeTruthy();
+    expect(screen.getByText("/Users/me/Docs/deep")).toBeTruthy();
+    emitSearch({ type: "state", searchId: args.searchId, state: "live" });
+    expect(screen.getAllByText(/best-effort/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/\bcomplete\b/i)).toBeNull();
+  });
+
+  it("uses content mode and never treats an empty live result as certainty", async () => {
+    await start();
+    fireEvent.change(screen.getByLabelText("Search by"), { target: { value: "content" } });
+    const args = await search("needle");
+    expect(args.mode).toBe("content");
+    emitSearch({ type: "state", searchId: args.searchId, state: "live" });
+    expect(screen.getByText(/does not prove nothing matches/)).toBeTruthy();
+  });
+
+  it("ignores events of another search id", async () => {
+    await start();
+    const args = await search("report");
+    emitSearch({ type: "results", searchId: "other", entries: [nested], skipped: 0 });
+    expect(screen.queryByText("report.txt")).toBeNull();
+    emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 3 });
+    expect(screen.getByText(/3 matches were left out/)).toBeTruthy();
+  });
+
+  it("Escape cancels natively and restores the folder listing", async () => {
+    await start();
+    const args = await search("report");
+    fireEvent.keyDown(box(), { key: "Escape" });
+    await waitFor(() => expect(called("cancel_search")[0]?.args).toEqual({ searchId: args.searchId }));
+    expect(screen.getByText("a.txt")).toBeTruthy();
+    expect(screen.queryByText(/Searching/)).toBeNull();
+  });
+
+  it("a new query cancels the previous native search", async () => {
+    await start();
+    const first = await search("one");
+    fireEvent.change(box(), { target: { value: "two" } });
+    fireEvent.keyDown(box(), { key: "Enter" });
+    await waitFor(() => expect(called("start_search").length).toBe(2));
+    await waitFor(() => expect(called("cancel_search").some((c) => c.args.searchId === first.searchId)).toBe(true));
+    emitSearch({ type: "results", searchId: first.searchId, entries: [nested], skipped: 0 });
+    expect(screen.queryByText("report.txt")).toBeNull();
+  });
+
+  it("shows a failure as an error, not an empty result", async () => {
+    await start();
+    const args = await search("report");
+    emitSearch({ type: "failed", searchId: args.searchId, error: { category: "permissionDenied", operation: "search", context: null, message: "Cannot search this folder" } });
+    expect(screen.getByRole("alert").textContent).toContain("Cannot search this folder");
+    expect(screen.queryByText(/no matches/)).toBeNull();
+  });
+
+  it("⌘F focuses the search box", async () => {
+    await start();
+    menu("search");
+    await waitFor(() => expect(document.activeElement).toBe(box()));
+  });
+
+  it("opens a folder result by its id and shows the containing folder with the item selected", async () => {
+    await start();
+    const args = await search("deep");
+    emitSearch({ type: "results", searchId: args.searchId, entries: [deepDir, nested], skipped: 0 });
+    fireEvent.contextMenu(screen.getByText("report.txt").closest('[role="row"]')!);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Show containing folder/ }));
+    await waitFor(() => expect(called("parent_directory")[0]?.args).toEqual({ id: nested.id }));
+    await waitFor(() => expect(reads[reads.length - 1]!.id).toBe(deepDir.id));
+    await waitFor(() => expect(called("cancel_search").length).toBe(1));
+    finishRead(reads[reads.length - 1]!.readId, [nested]);
+    expect(screen.getByText("report.txt").closest('[role="row"]')!.getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("does not paste or create folders into a search result list", async () => {
+    await start();
+    const args = await search("report");
+    emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
+    fireEvent.click(screen.getByText("report.txt").closest('[role="row"]')!);
+    menu("copy");
+    menu("paste");
+    menu("new-folder");
+    expect(called("start_transfer").length).toBe(0);
+    expect(called("create_folder").length).toBe(0);
+  });
+
+  it("trashes search results by their own ids", async () => {
+    await start();
+    const args = await search("report");
+    emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
+    fireEvent.click(screen.getByText("report.txt").closest('[role="row"]')!);
+    menu("trash");
+    await waitFor(() => expect(called("trash_items")[0]?.args).toMatchObject({ ids: [nested.id] }));
+  });
+
+  async function rename(row: string, name: string) {
+    fireEvent.click(screen.getByText(row).closest('[role="row"]')!);
+    menu("rename");
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: name } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  }
+
+  it("renaming a descendant re-runs the query natively instead of guessing, and refreshes its folder", async () => {
+    await start();
+    const args = await search("report");
+    emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
+    const readsBefore = reads.length;
+    await rename("report.txt", "budget.txt");
+    expect(called("rename_item")[0]!.args).toEqual({ id: nested.id, newName: "budget.txt" });
+    // The old query is cancelled and a fresh native one for the same text and mode starts.
+    await waitFor(() => expect(called("start_search").length).toBe(2));
+    expect(called("cancel_search")[0]!.args).toEqual({ searchId: args.searchId });
+    const again = called("start_search")[1]!.args as { searchId: string; query: string; mode: string; scopeId: string };
+    expect(again).toMatchObject({ query: "report", mode: "filename", scopeId: home.id });
+    expect(again.searchId).not.toBe(args.searchId);
+    // Nothing is shown until Spotlight reports; the renamed file is never admitted locally.
+    expect(screen.queryByText("budget.txt")).toBeNull();
+    expect(screen.queryByText("report.txt")).toBeNull();
+    // A late removal of the old id from the old query changes nothing.
+    emitSearch({ type: "removed", searchId: args.searchId, ids: [nested.id] });
+    expect(box().value).toBe("report");
+    await waitFor(() => expect(called("parent_directory").some((c) => c.args.id === hex("/Users/me/Docs/deep/budget.txt"))).toBe(true));
+    expect(reads.length).toBe(readsBefore);
+    // Whatever the new query reports (here: a still-matching rename) is what is shown.
+    emitSearch({ type: "results", searchId: again.searchId, entries: [entry("/Users/me/Docs/deep/Report-2.txt")], skipped: 0 });
+    expect(screen.getByText("Report-2.txt")).toBeTruthy();
+  });
+
+  it("renaming a direct child re-runs the search, keeps it, and reloads the folder", async () => {
+    await start();
+    const args = await search("report");
+    emitSearch({ type: "results", searchId: args.searchId, entries: [direct], skipped: 0 });
+    const readsBefore = reads.length;
+    await rename("report-direct.txt", "budget-direct.txt");
+    await waitFor(() => expect(called("start_search").length).toBe(2));
+    await waitFor(() => expect(reads.length).toBe(readsBefore + 1));
+    expect(screen.queryByText("budget-direct.txt")).toBeNull();
+    expect(box().value).toBe("report");
+    expect(called("cancel_search").length).toBe(1);
+    const again = called("start_search")[1]!.args as { searchId: string };
+    emitSearch({ type: "results", searchId: again.searchId, entries: [nested], skipped: 0 });
+    expect(screen.getByText("report.txt")).toBeTruthy();
+  });
+
+  it("a limited search stops showing Searching or live maintenance", async () => {
+    await start();
+    const args = await search("report");
+    emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
+    expect(screen.getByText(/Searching/)).toBeTruthy();
+    emitSearch({ type: "limited", searchId: args.searchId, limit: 1 });
+    expect(screen.queryByText(/Searching/)).toBeNull();
+    expect(screen.getByText(/Stopped after 1 results/)).toBeTruthy();
+    expect(screen.getByText(/no longer updated/)).toBeTruthy();
+    expect(screen.queryByText(/keeps this list up to date/)).toBeNull();
+    emitSearch({ type: "state", searchId: args.searchId, state: "live" });
+    expect(screen.queryByText(/keeps this list up to date/)).toBeNull();
+    expect(document.querySelector('[aria-busy="true"]')).toBeNull();
+  });
+});

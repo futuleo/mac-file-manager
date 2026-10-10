@@ -6,10 +6,12 @@ interface Props {
   selected: number;
   selectedBytes: number | null;
   loading: boolean;
+  /** Set while a Spotlight search is shown: a short, honest status. */
+  searchStatus?: string | null;
   formatBytes(bytes: number): string;
 }
 
-export default function StatusBar({ total, hidden, selected, selectedBytes, loading, formatBytes }: Props) {
+export default function StatusBar({ total, hidden, selected, selectedBytes, loading, formatBytes, searchStatus }: Props) {
   const items = `${total} item${total === 1 ? "" : "s"}`;
   return (
     <footer className="statusbar">
@@ -18,6 +20,7 @@ export default function StatusBar({ total, hidden, selected, selectedBytes, load
         {hidden > 0 ? ` (${hidden} hidden)` : ""}
         {loading ? " — loading…" : ""}
       </span>
+      {searchStatus && <span>{searchStatus}</span>}
       {selected > 0 && (
         <span>
           {selected} selected{selectedBytes !== null && selectedBytes > 0 ? ` ${formatBytes(selectedBytes)}` : ""}

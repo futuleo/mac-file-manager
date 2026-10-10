@@ -7,8 +7,9 @@ command area, back/forward/up/refresh, breadcrumb/address bar, sidebar of real
 locations, a virtualized details list (Name / Date modified / Type / Size) and a
 status bar, all wired to the real backend commands. **File operations** (new
 folder, copy, cut/paste move, rename, Move to the Trash) are implemented; see
-[File operations](#file-operations). Search, preview, Finder drag-and-drop,
-Properties and "Move to" are **not implemented**; their controls are shown
+[File operations](#file-operations). **Spotlight search** of the current folder
+(filenames or contents) is implemented; see [Search](#search). Preview, Finder
+drag-and-drop, Properties and "Move to" are **not implemented**; their controls are shown
 disabled ("Not available yet").
 
 See [plan.md](plan.md) for product scope and implementation tasks.
@@ -59,7 +60,7 @@ The `--no-bundle` build produces `src-tauri/target/release/mac-file-manager`
 - `src-tauri/src/contracts.rs` – command/event contracts: `FileEntry` (with a
   lossless hex path `id` for non-UTF-8 names), `AppError`, `TaskEvent`
   (progress, conflict, finished with partial failures, cancelled, failed),
-  `SearchEvent`, `PlatformInfo`. Rust tests pin the JSON format.
+  `SearchEvent` (results as upserts, removals, state, limit, failure), `PlatformInfo`. Rust tests pin the JSON format.
 - `src-tauri/src/filesystem.rs` – read-only filesystem service (see
   [Filesystem backend](#filesystem-backend)).
 - `src/backend/directory.ts` – directory-read client (`readDirectory`);
@@ -77,6 +78,8 @@ The `--no-bundle` build produces `src-tauri/target/release/mac-file-manager`
 - `src-tauri/examples/` – feasibility spikes, not shipped:
   `cargo run --manifest-path src-tauri/Cargo.toml --example platform_spike`
   (Spotlight, Trash, icons) and `--example quicklook_spike` (needs a GUI session).
+  `--example spotlight_check` runs the production search service against a real
+  Spotlight index (see [Search](#search)).
   Each run creates its own exclusively named directory (`~/mfm-spike-*` for
   Spotlight, which needs an indexed location; `$TMPDIR/mfm-spike-ql-*` for Quick Look),
   never writes into an existing path, and removes only that directory, reporting
@@ -112,8 +115,8 @@ only (API available), not exercised behavior; external dragging is untested.
 
 Limitations: "hidden" means a leading dot (the macOS hidden flag is not read);
 rows stay in directory order while a folder is still loading and are sorted
-when it finishes; Details is the only layout; search, copy/cut/paste/move/delete/
-rename/new folder, properties and preview are disabled placeholders.
+when it finishes; Details is the only layout; properties and preview are disabled
+placeholders.
 
 ## Filesystem backend
 
@@ -187,6 +190,50 @@ include `notFound`, `permissionDenied`, `invalidInput`, `io`):
   launching an application through `open_item` (only the default-application
   lookup is tested, to avoid launching apps during tests); icons off the main
   thread under heavy concurrency (calls are serialized by a lock); network volumes; macOS older than 26 and Intel at runtime.
+
+## Search
+
+`start_search` / `cancel_search` (typed commands; events on `search-event`, tagged with a
+`searchId`) drive a native `NSMetadataQuery` owned by Rust (`src-tauri/src/search.rs` is the
+session/registry, `spotlight.rs` the main-thread query driver). The search box (⌘F, menu
+Edit → Search This Folder) searches the **current folder and its descendants** by file name or by
+contents (mode selector); Return starts, Escape or clearing the box cancels.
+
+- **Safety**: the query text is bound with `predicateWithFormat:argumentArray:` into two fixed
+  formats; it is never concatenated into a predicate or shell command, and no custom index is
+  built. Limits: 256 characters, 10,000 results, 16 concurrent searches. A missing, non-folder,
+  unreadable or vanished scope is an error, not an empty result.
+- **Lifecycle**: one query per tab. A new query, navigation, clearing, closing the tab, or closing
+  the window cancels and releases the native query (observers removed, `stopQuery`). The UI
+  subscribes before starting and treats a listener error as a failed search; events carry the
+  search id and the reducer ignores stale ones. Results arrive incrementally (main-thread work is
+  batched), files are verified on a worker thread, and vanished or unreadable matches are counted
+  as "left out". Live updates (new, changed, removed items) keep the list current until cleared.
+  Large result sets continue in later main-queue turns (never inline, 500 results per turn). Reaching the result
+  limit (state "limited": the list is final and no longer updated) or a failure ends the search: the worker itself releases the native query and
+  unregisters the search, without waiting for another Spotlight notification.
+- **Results** use the original lossless ids: open file, open folder (navigates there), and
+  "Show containing folder" (navigates to the real parent and selects the item). Copy, cut,
+  rename and Move to the Trash work on the results' own ids; Paste and New folder are disabled in
+  a result list because there is no single destination folder. After a file operation the search
+  is re-run; after a rename the query is run again, so Spotlight alone decides whether the new name still matches (the list briefly restarts, and a just-renamed file may take a while to be re-indexed); the folder it lives in is refreshed and the search is kept. Properties, Quick Look and dragging remain unavailable.
+- **Honest limits**: Spotlight cannot say whether a folder is indexed, whether access was denied,
+  or whether it finished, so the state is only *gathering* or *live*, there is no "complete", and
+  "no matches" is worded as not proof of absence. Content search depends on installed
+  importers; recently created or changed files may not be indexed yet (observed delay of about
+  40 s below); results can be stale. Search results are never persisted.
+
+Verification: Rust unit tests (query validation, scope errors, scoping/dedupe/stale skipping,
+cancellation silence, limit, native failure, registry; predicate binding evaluated with
+hostile text; mock-runtime IPC rejections). Vitest with **mocked IPC** covers the client
+(subscribe-first, fail-closed, stale ids), the per-tab reducer and the App wiring. Real
+Spotlight: `cargo run --manifest-path src-tauri/Cargo.toml --example spotlight_check` creates an
+owned non-dot fixture under `$HOME`, queries only its unique tokens, and removes it. On macOS
+26.6.1 (arm64) it observed the fixture file by name (first result ~43 s after the query started,
+delivered as a live update) and by content, and confirmed cancellation released the native
+query. Not verified: the real WebView search UI and the native ⌘F menu item (no screen capture
+or accessibility access here, see Limitations); content search for importer-less formats;
+network volumes; a real second volume.
 
 ## Native API findings
 

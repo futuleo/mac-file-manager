@@ -105,10 +105,18 @@ export type TaskEvent =
   | { type: "failed"; taskId: string; error: AppError };
 
 export type SearchMode = "filename" | "content";
+/** There is deliberately no "complete": Spotlight cannot report whether a folder is fully indexed. */
 export type SearchState = "gathering" | "live" | "cancelled";
+/**
+ * Spotlight search events, tagged with the caller's `searchId`. `results` are upserts by `id`;
+ * `skipped` counts matches left out because the item vanished or was unreadable (stale index).
+ * `limited` means the result cap was reached and the list is incomplete by design.
+ */
 export type SearchEvent =
-  | { type: "results"; searchId: string; entries: FileEntry[] }
+  | { type: "results"; searchId: string; entries: FileEntry[]; skipped: number }
+  | { type: "removed"; searchId: string; ids: string[] }
   | { type: "state"; searchId: string; state: SearchState }
+  | { type: "limited"; searchId: string; limit: number }
   | { type: "failed"; searchId: string; error: AppError };
 
 export interface NativeCapabilities {
@@ -163,6 +171,13 @@ export interface ImplementedCommands {
   create_folder: { args: { parentId: string; name: string | null }; result: FileEntry };
   /** Same-folder rename that never replaces another item. */
   rename_item: { args: { id: string; newName: string }; result: FileEntry };
+  /**
+   * Starts a native Spotlight search of the folder `scopeId` and its descendants. Returns once
+   * queued; results arrive on SEARCH_EVENT tagged with `searchId`. Best-effort, never proof of absence.
+   */
+  start_search: { args: { searchId: string; scopeId: string; mode: SearchMode; query: string }; result: void };
+  /** Idempotent; releases the native query. */
+  cancel_search: { args: { searchId: string }; result: void };
   /** Applies copy/cut/paste/selectAll to the focused text field. */
   edit_action: { args: { action: "copy" | "cut" | "paste" | "selectAll" }; result: void };
 }
@@ -173,7 +188,5 @@ export interface ImplementedCommands {
  * Rejections carry an `AppError`.
  */
 export interface PlannedCommands {
-  start_search: { args: { searchId: string; scopeId: string; mode: SearchMode; query: string }; result: void }; // spotlight-search; results via SEARCH_EVENT
-  cancel_search: { args: { searchId: string }; result: void };
   show_quick_look: { args: { ids: string[] }; result: void }; // quick-look
 }

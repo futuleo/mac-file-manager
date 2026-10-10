@@ -174,3 +174,8 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
 .dialog-note { color: var(--text-muted); }
 .dialog-error { color: var(--danger); }
 .dialog-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; justify-content: flex-end; }
+
+.cell.name .location { margin-left: 8px; color: var(--muted, #6b6b6b); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-group { display: flex; align-items: center; gap: 4px; }
+.search-mode { height: 26px; border: 1px solid var(--border); background: var(--chrome); }
+.search-banner { padding: 4px 10px; font-size: 12px; border-bottom: 1px solid var(--border); }

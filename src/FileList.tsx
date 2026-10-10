@@ -33,6 +33,14 @@ interface Props {
   onActivate(entry: FileEntry): void;
   onContextMenu(entry: FileEntry | null, x: number, y: number): void;
   onRename(): void;
+  /** Search results come from many folders, so each row also shows its containing folder. */
+  showLocation?: boolean;
+}
+
+/** Display-only parent of an entry's path. */
+function containingFolder(entry: FileEntry): string {
+  const cut = entry.path.lastIndexOf("/");
+  return cut <= 0 ? "/" : entry.path.slice(0, cut);
 }
 
 function FileList(props: Props) {
@@ -222,6 +230,7 @@ function FileList(props: Props) {
         <div role="gridcell" className="cell name">
           <FileIcon id={entry.id} kind={entry.kind} />
           <span className="label">{entry.name}</span>
+          {props.showLocation && <span className="location">{containingFolder(entry)}</span>}
         </div>
         <div role="gridcell" className="cell">
           {formatDate(entry.modifiedMs)}

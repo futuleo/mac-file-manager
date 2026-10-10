@@ -12,7 +12,7 @@ use tauri::{
 use crate::contracts::MENU_EVENT;
 
 /// Menu item ids the frontend acts on (see `src/App.tsx`).
-const FORWARDED: [&str; 19] = [
+const FORWARDED: [&str; 20] = [
     "new-tab",
     "close-tab",
     "next-tab",
@@ -32,6 +32,7 @@ const FORWARDED: [&str; 19] = [
     "paste",
     "rename",
     "trash",
+    "search",
 ];
 
 pub fn forward(app: &AppHandle, event: MenuEvent) {
@@ -99,6 +100,8 @@ pub fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
             &enabled(app, "copy", "Copy", "CmdOrCtrl+C")?,
             &enabled(app, "paste", "Paste", "CmdOrCtrl+V")?,
             &enabled(app, "select-all", "Select All", "CmdOrCtrl+A")?,
+            &PredefinedMenuItem::separator(app)?,
+            &enabled(app, "search", "Search This Folder", "CmdOrCtrl+F")?,
         ],
     )?;
     let view = Submenu::with_items(
