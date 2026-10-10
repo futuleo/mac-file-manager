@@ -4,7 +4,7 @@
 
 The user authorized configuring the full autonomous writer/reviewer/fix/merge cycle.
 The scaffold, read-only filesystem backend and Explorer UI shell are implemented.
-File operations (folder creation, copy, move, rename, Trash) and Spotlight search are implemented; preview and drag-and-drop remain unimplemented.
+File operations (folder creation, copy, move, rename, Trash), Spotlight search and Quick Look are implemented; mouse marquee selection is implemented (native evidence in its PR); drag-and-drop remains unimplemented and its tests are paused.
 Before implementing, reread this file, including any user edits.
 
 This repository file is the source of truth for the implementation plan.
@@ -22,6 +22,12 @@ Windows 10 File Explorer while preserving correct macOS filesystem behavior and 
 - Opening files, creating folders, copying, moving, renaming, and moving items to Trash.
   Filename conflicts require an explicit user decision.
 - Tabs, search, preview, and drag-and-drop are included in the first release.
+- Mass selection with the mouse: rectangle (marquee) selection starting from empty
+  list space, with edge autoscroll, in folder and search-result views. User's words:
+  "we don't have mass selection with the mouse"; the user confirmed it is missing and
+  asked to add it as a task.
+- User-directed pause: drag-and-drop tests and native acceptance runs wait until marquee
+  selection is implemented; restart them only when the user authorizes it.
 - Search filenames and file contents using the system Spotlight index.
 - Prepare the plan and useful skills before implementing.
 - Full autonomous cycle: a writer commits and opens PRs; a separate reviewer checks
@@ -132,11 +138,15 @@ manually reproducing a framework template.
    cancellation, incremental delivery, result navigation, and honest index states.
 7. quick-look: Connect Quick Look to selection and Space; handle tab changes,
    disappearing files, and preview lifecycle correctly.
-8. drag-drop: Implement internal dragging and file URL exchange with Finder;
+8. marquee-selection: Mouse rectangle selection from empty space in folder and search
+   views (virtualized rows, edge autoscroll, Command/Shift modifiers, Escape, tab/list
+   changes) distinct from dragging selected files; keep click, keyboard and Quick Look
+   selection behavior.
+9. drag-drop: Implement internal dragging and file URL exchange with Finder;
    reuse the safe operation service and conflict dialogs.
-9. acceptance: Validate the integrated application, accessibility, actual file
+10. acceptance: Validate the integrated application, accessibility, actual file
    operation behavior, and large directories. Fix directly related defects.
-10. documentation: Update README with actual setup/run/build/check commands,
+11. documentation: Update README with actual setup/run/build/check commands,
     macOS requirements, and Spotlight, permission, and preview limitations.
 
 Dependencies:
@@ -146,8 +156,9 @@ explorer-ui <- filesystem;
 file-operations <- explorer-ui;
 spotlight-search <- explorer-ui;
 quick-look <- explorer-ui;
+marquee-selection <- explorer-ui;
 drag-drop <- file-operations;
-acceptance <- file-operations, spotlight-search, quick-look, drag-drop;
+acceptance <- file-operations, spotlight-search, quick-look, marquee-selection, drag-drop;
 documentation <- acceptance.
 
 ## Validation and acceptance criteria
@@ -172,6 +183,10 @@ commands before those scripts exist.
   macOS settings without permission.
 - Quick Look actually opens the selected file. Exercise at least an image, a PDF,
   and a text file where supported by installed preview providers.
+- Mouse rectangle selection works in real folders and search results: dragging from empty
+  space selects the touched rows, Shift adds, Command toggles, a drag at the list edge
+  autoscrolls in a large fixture, and a plain empty-space click still clears. It does not
+  start when pressing on a file, header or scrollbar. Verify natively, not only in jsdom.
 - Test drag-and-drop in both directions with Finder, including copy/move and conflicts.
 - Verify safe handling of search/file-opening input, Tauri permissions, no arbitrary
   frontend-triggered shell execution, and no remotely loaded application content.

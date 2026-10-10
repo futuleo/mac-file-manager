@@ -75,3 +75,34 @@ export function prune(sel: Selection, entries: readonly FileEntry[]): Selection 
     focus: sel.focus !== null && present.has(sel.focus) ? sel.focus : null,
   };
 }
+
+/**
+ * Rectangle (marquee) selection. `base` is the selection when the gesture started and
+ * `band` the inclusive row indexes the rectangle currently touches.
+ * - "replace" (no modifier): only the touched rows are selected.
+ * - "add" (Shift): the touched rows are added to `base`.
+ * - "toggle" (Command/Control): touched rows flip relative to `base`, as with ⌘-click.
+ * Focus is left alone while dragging; `forward` says whether the pointer moved down the list.
+ */
+export type MarqueeMode = "replace" | "add" | "toggle";
+
+export function marqueeSelection(
+  rows: readonly FileEntry[],
+  base: Selection,
+  band: { first: number; last: number } | null,
+  mode: MarqueeMode,
+  forward: boolean,
+): Selection {
+  const touched: string[] = [];
+  if (band) for (let i = band.first; i <= band.last; i += 1) touched.push(rows[i]!.id);
+  const ids = new Set(mode === "replace" ? [] : base.ids);
+  for (const id of touched) {
+    if (mode === "toggle" && base.ids.has(id)) ids.delete(id);
+    else ids.add(id);
+  }
+  const startSide = forward ? touched[0] : touched[touched.length - 1];
+  return { ids, anchor: startSide ?? base.anchor, focus: base.focus };
+}
+
+export const sameIds = (a: ReadonlySet<string>, b: ReadonlySet<string>) =>
+  a.size === b.size && [...a].every((id) => b.has(id));

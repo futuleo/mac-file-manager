@@ -36,3 +36,23 @@ export function scrollTopFor(
   if (bottom > scrollTop + viewport) return Math.max(0, bottom - viewport);
   return scrollTop;
 }
+
+/**
+ * Inclusive row indexes touched by the vertical band `[top, bottom]` (body coordinates, which may
+ * be negative or past the last row), or null when no row is touched. Works from geometry alone, so
+ * rows that are not mounted are still found.
+ */
+export function rowsInBand(
+  top: number,
+  bottom: number,
+  count: number,
+  rowHeight = ROW_HEIGHT,
+): { first: number; last: number } | null {
+  const lo = Math.min(top, bottom);
+  const hi = Math.max(top, bottom);
+  if (count === 0 || hi < 0 || lo >= count * rowHeight) return null;
+  return {
+    first: Math.max(0, Math.floor(lo / rowHeight)),
+    last: Math.min(count - 1, Math.floor(hi / rowHeight)),
+  };
+}
