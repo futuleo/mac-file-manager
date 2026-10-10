@@ -471,6 +471,52 @@ describe("stale and reordered targets", () => {
   });
 });
 
+describe("rejected hover requests", () => {
+  const failing = (selector: (args: Record<string, unknown>) => boolean) => {
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command: string, args: Record<string, unknown>) => {
+      if (command === "drag_hover" && selector(args)) {
+        calls.push({ command, args });
+        throw { category: "invalidInput", operation: "drag and drop", context: null, message: "Checking the target failed." };
+      }
+      return base(command, args);
+    });
+  };
+
+  it("a rejected request for the current pointer is not retried, is shown once, and newer input recovers", async () => {
+    await start();
+    failing((args) => args.pointer === 1);
+    await enter();
+    pointAt(rowFor("Docs"));
+    await over();
+    await waitFor(() => expect(called("drag_hover").length).toBe(1));
+    expect((await screen.findAllByText(/Checking the target failed/)).length).toBeGreaterThan(0);
+    await act(async () => new Promise((r) => setTimeout(r, 50)));
+    expect(called("drag_hover").length).toBe(1); // no silent loop
+    await drop("d1", false, null);
+    expect(called("drag_drop_transfer").length).toBe(0);
+    await enter("d2");
+    await over("d2");
+    await waitFor(() => expect(rowFor("Docs").className).toMatch(/drop-target/));
+  });
+
+  it("repeated rejections of the same pointer stay bounded; a newer pointer update asks again", async () => {
+    await start();
+    failing(() => true);
+    await enter();
+    pointAt(document.body);
+    await over();
+    await act(async () => new Promise((r) => setTimeout(r, 50)));
+    expect(called("drag_hover").length).toBe(1);
+    await over();
+    await waitFor(() => expect(called("drag_hover").length).toBe(2));
+    await act(async () => new Promise((r) => setTimeout(r, 50)));
+    expect(called("drag_hover").length).toBe(2);
+    expect(called("drag_hover").map((c) => c.args.pointer)).toEqual([1, 2]);
+    expect((await screen.findAllByText(/Checking the target failed/)).length).toBeGreaterThan(0);
+  });
+});
+
 describe("task events stay separate", () => {
   it("only listens to its own tasks", async () => {
     await start();

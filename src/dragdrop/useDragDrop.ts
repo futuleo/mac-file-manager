@@ -57,6 +57,8 @@ interface Active {
   target: Target | null;
   token: number;
   busy: boolean;
+  /** A rejected hover request was already shown for this drag. */
+  reported: boolean;
   latest: Extract<DragEvent, { type: "over" }> | null;
 }
 
@@ -104,6 +106,19 @@ export function useDragDrop(options: Options) {
       setHighlight(null);
     };
 
+    // A rejected request for the current pointer update is final for that update: it is settled
+    // (so it is not asked again until the pointer sends newer input) and shown once per drag.
+    const fail = (drag: Active, target: Target, reason: unknown) => {
+      target.reason = toAppError(reason, "check the drop target").message;
+      target.operation = null;
+      target.settled = true;
+      setHighlight(target.key ? { key: target.key, allowed: false } : null);
+      if (!drag.reported) {
+        drag.reported = true;
+        opts.current.onProblem(target.reason, target.ctx.tabId || null);
+      }
+    };
+
     const settle = (drag: Active) => {
       drag.busy = false;
       pump(drag);
@@ -128,7 +143,10 @@ export function useDragDrop(options: Options) {
             if (active.current === drag && drag.target === target) target.settled = true;
             settle(drag);
           },
-          () => settle(drag),
+          (reason) => {
+            if (active.current === drag && drag.target === target) fail(drag, target, reason);
+            settle(drag);
+          },
         );
         return;
       }
@@ -147,10 +165,7 @@ export function useDragDrop(options: Options) {
           settle(drag);
         },
         (reason) => {
-          if (active.current === drag && drag.target === target) {
-            target.reason = toAppError(reason, "check the drop target").message;
-            target.settled = true;
-          }
+          if (active.current === drag && drag.target === target) fail(drag, target, reason);
           settle(drag);
         },
       );
@@ -206,7 +221,7 @@ export function useDragDrop(options: Options) {
     const subscription = listen<DragEvent>(DRAG_EVENT, ({ payload }) => {
       switch (payload.type) {
         case "enter":
-          active.current = { dragId: payload.dragId, count: payload.count, target: null, token: 0, busy: false, latest: null };
+          active.current = { dragId: payload.dragId, count: payload.count, target: null, token: 0, busy: false, reported: false, latest: null };
           opts.current.announce(`Dragging ${payload.count} item${payload.count === 1 ? "" : "s"}`);
           return;
         case "over":
