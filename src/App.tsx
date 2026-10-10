@@ -68,7 +68,7 @@ export default function App() {
   const [previewOpen, setPreviewOpen] = useState(false);
   // Starts at the clock so a reloaded page never sends numbers the backend already saw.
   const previewSerial = useRef(Date.now());
-  const previewPending = useRef(false);
+  const previewUnsettled = useRef(false);
   const [nameState, setNameState] = useState<NameState | null>(null);
 
   // Reload only the tabs showing a changed folder; `reveal` selects an item in one tab.
@@ -301,16 +301,16 @@ export default function App() {
       return;
     }
     const serial = ++previewSerial.current;
-    previewPending.current = true;
+    previewUnsettled.current = true;
     call("quick_look_toggle", { seq: serial, ids }).then(
       (open) => {
         if (serial !== previewSerial.current) return;
-        previewPending.current = false;
+        previewUnsettled.current = false;
         setPreviewOpen(open);
       },
       (reason) => {
         if (serial !== previewSerial.current) return;
-        previewPending.current = false;
+        previewUnsettled.current = false;
         setPreviewOpen(false);
         dispatch({ type: "action-error", tabId: t.id, error: toAppError(reason, "preview the selection") });
       },
@@ -468,24 +468,31 @@ export default function App() {
 
   // While the panel is open it follows the active tab's selection (and its query); a
   // reply for an older selection is ignored, and an empty selection closes it.
-  // A context change while an open is still pending also sends a sync: the backend then
+  // While the newest toggle/sync is unsettled, a context change also sends a sync: the backend then
   // supersedes the pending open so it cannot show a stale selection.
   const previewKey = rows.filter((e) => selection.ids.has(e.id)).map((e) => e.id).join("\0");
   const previewContext = `${activeId}|${tab?.search?.key ?? ""}|${tab?.nav ?? ""}`;
   useEffect(() => {
-    if (!previewOpen && !previewPending.current) return;
+    if (!previewOpen && !previewUnsettled.current) return;
     const tabId = activeId;
     const serial = ++previewSerial.current;
-    previewPending.current = false;
+    previewUnsettled.current = true;
     call("quick_look_sync", { seq: serial, ids: previewKey ? previewKey.split("\0") : [] }).then(
-      (open) => serial === previewSerial.current && !open && setPreviewOpen(false),
+      (open) => {
+        if (serial !== previewSerial.current) return;
+        previewUnsettled.current = false;
+        // The newest answer is authoritative, also when a still-pending open already showed the panel.
+        setPreviewOpen(open);
+      },
       (reason) => {
         if (serial !== previewSerial.current) return;
+        previewUnsettled.current = false;
         setPreviewOpen(false);
         if (tabId) dispatch({ type: "action-error", tabId, error: toAppError(reason, "preview the selection") });
       },
     );
-  }, [previewOpen, previewKey, previewContext]);
+  // Reacts to selection/context only (not to the open flag), so an open does not trigger a redundant sync.
+  }, [previewKey, previewContext]);
 
   // Announce load outcomes for screen readers.
   const status = tab?.listing.status;

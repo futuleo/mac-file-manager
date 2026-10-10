@@ -49,6 +49,19 @@ let reads: { readId: string; id: string }[] = [];
 let calls: { command: string; args: Record<string, unknown> }[] = [];
 let failCommand: Record<string, unknown> = {};
 let toggleOpens = true;
+// Commands whose replies the test settles by hand, in the order it chooses.
+const held = new Set<string>();
+let replies: { command: string; seq: number; settle: (open: boolean) => void }[] = [];
+const hold = (command: string) =>
+  new Promise<boolean>((settle) => {
+    const seq = calls[calls.length - 1]!.args.seq as number;
+    replies.push({ command, seq, settle });
+  });
+const reply = (command: string, nth: number, open: boolean) =>
+  act(async () => {
+    replies.filter((r) => r.command === command)[nth]!.settle(open);
+    await Promise.resolve();
+  });
 let syncOpen = true;
 
 const menu = (id: string) =>
@@ -72,6 +85,8 @@ beforeEach(() => {
   failCommand = {};
   toggleOpens = true;
   syncOpen = true;
+  held.clear();
+  replies = [];
   mocks.listeners = [];
   mocks.rejectTaskListener = false;
   localStorage.clear();
@@ -87,8 +102,8 @@ beforeEach(() => {
       case "start_directory_read":
         reads.push({ readId: args.readId as string, id: args.id as string });
         return undefined;
-      case "quick_look_toggle": return toggleOpens;
-      case "quick_look_sync": return syncOpen;
+      case "quick_look_toggle": return held.has("quick_look_toggle") ? hold("quick_look_toggle") : toggleOpens;
+      case "quick_look_sync": return held.has("quick_look_sync") ? hold("quick_look_sync") : syncOpen;
       case "create_folder": return dir("/Users/me/New folder");
       case "rename_item": return dir(`/Users/me/${args.newName as string}`);
       case "get_icon": throw new Error("no icon in tests");
@@ -148,7 +163,8 @@ describe("Quick Look UI (mocked IPC)", () => {
     await start();
     select("a.txt");
     menu("quick-look");
-    await waitFor(() => expect(called("quick_look_sync").length).toBe(1));
+    await waitFor(() => expect(called("quick_look_toggle").length).toBe(1));
+    await act(async () => { await Promise.resolve(); });
     select("b.txt");
     await waitFor(() => expect(called("quick_look_sync").slice(-1)[0]!.args).toMatchObject({ ids: [b.id] }));
     syncOpen = false;
@@ -164,7 +180,8 @@ describe("Quick Look UI (mocked IPC)", () => {
     await start();
     select("a.txt");
     menu("quick-look");
-    await waitFor(() => expect(called("quick_look_sync").length).toBe(1));
+    await waitFor(() => expect(called("quick_look_toggle").length).toBe(1));
+    await act(async () => { await Promise.resolve(); });
     fireEvent.click(screen.getByRole("button", { name: "New tab" }));
     await waitFor(() => expect(called("quick_look_sync").slice(-1)[0]!.args).toMatchObject({ ids: [] }));
   });
@@ -184,7 +201,8 @@ describe("Quick Look UI (mocked IPC)", () => {
     await start();
     select("a.txt");
     menu("quick-look");
-    await waitFor(() => expect(called("quick_look_sync").length).toBe(1));
+    await waitFor(() => expect(called("quick_look_toggle").length).toBe(1));
+    await act(async () => { await Promise.resolve(); });
     failCommand.quick_look_sync = { category: "permissionDenied", message: "Not allowed to preview b.txt.", operation: "preview", context: "b.txt" };
     select("b.txt");
     expect(await screen.findByText(/Not allowed to preview/)).toBeTruthy();
@@ -194,8 +212,11 @@ describe("Quick Look UI (mocked IPC)", () => {
     await start();
     select("a.txt");
     menu("quick-look");
-    await waitFor(() => expect(called("quick_look_sync").length).toBe(1));
+    await waitFor(() => expect(called("quick_look_toggle").length).toBe(1));
+    await act(async () => { await Promise.resolve(); });
     select("b.txt");
+    await waitFor(() => expect(called("quick_look_sync").length).toBe(1));
+    select("a.txt");
     await waitFor(() => expect(called("quick_look_sync").length).toBe(2));
     const seqs = [...called("quick_look_toggle"), ...called("quick_look_sync")].map((c) => c.args.seq as number);
     expect(seqs.every((n, i) => i === 0 || n !== seqs[i - 1])).toBe(true);
@@ -205,34 +226,70 @@ describe("Quick Look UI (mocked IPC)", () => {
     expect(sync[0]).toBeGreaterThan(called("quick_look_toggle")[0]!.args.seq as number);
   });
 
-  it("a selection change while the first open is still pending supersedes it", async () => {
-    await start();
-    let release: (open: boolean) => void = () => undefined;
-    toggleOpens = new Promise<boolean>((r) => (release = r)) as unknown as boolean;
+  it("pending open, B sync answers true, then C still gets a sync and the UI adopts true", async () => {
+    await start([a, b, entry("/Users/me/c.txt")]);
+    held.add("quick_look_toggle");
+    held.add("quick_look_sync");
     select("a.txt");
     menu("quick-look");
     await waitFor(() => expect(called("quick_look_toggle").length).toBe(1));
-    expect(called("quick_look_sync").length).toBe(0);
     select("b.txt");
     await waitFor(() => expect(called("quick_look_sync").length).toBe(1));
-    expect(called("quick_look_sync")[0]!.args.ids).toEqual([b.id]);
-    expect(called("quick_look_sync")[0]!.args.seq as number).toBeGreaterThan(called("quick_look_toggle")[0]!.args.seq as number);
-    release(true);
-    await Promise.resolve();
-    // The late open reply is ignored: the UI does not claim an open preview of its own.
-    select("a.txt");
-    await Promise.resolve();
-    expect(called("quick_look_sync").length).toBe(1);
+    expect(called("quick_look_sync")[0]!.args).toMatchObject({ ids: [b.id] });
+    // The native panel already opened for the first toggle, so B's answer is true;
+    // the toggle's own (now superseded) reply arrives last and is ignored.
+    await reply("quick_look_sync", 0, true);
+    await reply("quick_look_toggle", 0, true);
+    select("c.txt");
+    await waitFor(() => expect(called("quick_look_sync").length).toBe(2));
+    expect(called("quick_look_sync")[1]!.args).toMatchObject({ ids: [hex("/Users/me/c.txt")] });
+    expect(called("quick_look_sync")[1]!.args.seq as number).toBeGreaterThan(called("quick_look_sync")[0]!.args.seq as number);
   });
 
-  it("opening a new tab or navigating while the open is pending also supersedes it", async () => {
+  it("C changing before B's sync settles still sends a sync, and only the newest reply counts", async () => {
+    await start([a, b, entry("/Users/me/c.txt")]);
+    held.add("quick_look_toggle");
+    held.add("quick_look_sync");
+    select("a.txt");
+    menu("quick-look");
+    await waitFor(() => expect(called("quick_look_toggle").length).toBe(1));
+    select("b.txt");
+    await waitFor(() => expect(called("quick_look_sync").length).toBe(1));
+    select("c.txt");
+    await waitFor(() => expect(called("quick_look_sync").length).toBe(2));
+    await reply("quick_look_sync", 1, true);
+    await reply("quick_look_sync", 0, false);
+    await reply("quick_look_toggle", 0, true);
+    // The UI now owns an open preview (newest answer true): the next change syncs again.
+    select("a.txt");
+    await waitFor(() => expect(called("quick_look_sync").length).toBeGreaterThan(2));
+    expect(called("quick_look_sync").slice(-1)[0]!.args).toMatchObject({ ids: [a.id] });
+  });
+
+  it("a newest sync answering false clears the open state", async () => {
     await start();
-    toggleOpens = new Promise<boolean>(() => undefined) as unknown as boolean;
+    held.add("quick_look_toggle");
+    held.add("quick_look_sync");
+    select("a.txt");
+    menu("quick-look");
+    await waitFor(() => expect(called("quick_look_toggle").length).toBe(1));
+    fireEvent.click(screen.getByRole("button", { name: "Select none" }));
+    await waitFor(() => expect(called("quick_look_sync").length).toBe(1));
+    await reply("quick_look_sync", 0, false);
+    const syncs = called("quick_look_sync").length;
+    select("b.txt");
+    await Promise.resolve();
+    expect(called("quick_look_sync").length).toBe(syncs);
+  });
+
+  it("opening a new tab while the open is pending sends an empty sync", async () => {
+    await start();
+    held.add("quick_look_toggle");
     select("a.txt");
     menu("quick-look");
     await waitFor(() => expect(called("quick_look_toggle").length).toBe(1));
     fireEvent.click(screen.getByRole("button", { name: "New tab" }));
     await waitFor(() => expect(called("quick_look_sync").length).toBe(1));
-    expect(called("quick_look_sync")[0]!.args.ids).toEqual([]);
+    expect(called("quick_look_sync")[0]!.args).toMatchObject({ ids: [] });
   });
 });

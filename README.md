@@ -350,8 +350,9 @@ app does not render previews itself and nothing is embedded in the window.
 - Ordering: every toggle/sync carries a growing `seq`. The backend keeps the newest `seq` per
   window and re-checks it on the main thread right before showing, updating or closing, so an
   older request that finishes late (or fails late) changes nothing and reports the panel as it
-  is. A selection/tab/navigation change while the first open is still pending also sends a sync,
-  which supersedes that open.
+  is. While the newest toggle/sync is unsettled, a selection/tab/navigation change also sends a
+  sync, which supersedes a pending open; the UI adopts the newest answer (open or closed), also
+  when the native panel had already opened before the open's own reply arrived.
 - Space only acts when the file list itself has focus, so typing in the address, search or
   name fields is untouched; the native menu item has no accelerator so Space cannot trigger twice.
 
@@ -361,7 +362,7 @@ Verification and limits:
   `NSWindow` and `WKWebView`, calls the commands through the webview's IPC, and reads back the
   `QLPreviewPanel` state (visible, owned by this window's controller, item count and URL) for
   owned temporary image, PDF and text fixtures, including superseded (older `seq`) requests,
-  back-to-back syncs, selection change, empty selection,
+  an older `seq` arriving after a newer one (both replies awaited), selection change, empty selection,
   vanished file, toggle-close, malformed ids and window close. It needs a logged-in GUI session.
 - It verifies panel state, **not rendered pixels**: screen capture and accessibility automation
   are not available here, so what the panel visually shows is unverified. Real Space-key

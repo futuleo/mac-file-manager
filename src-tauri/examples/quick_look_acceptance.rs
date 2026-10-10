@@ -303,26 +303,35 @@ mod run {
             r == Ok(true.into()) && snapshot(&app).visible,
             &r,
         );
-        // Two syncs issued back-to-back without waiting: the newer selection must win.
+        // The newest request (seq +11, text) is issued first and the older one (seq +10,
+        // pdf) right after, so the older one reaches the backend after a newer seq is
+        // registered. Both replies are awaited before the panel is read.
         let image_path = canonical(&text);
         let both = format!(
-            "Promise.all([window.__TAURI_INTERNALS__.invoke('quick_look_sync',{}),window.__TAURI_INTERNALS__.invoke('quick_look_sync',{})]).then(()=>{{location.hash='#done'}},()=>{{location.hash='#done'}})",
-            serde_json::json!({ "seq": newest + 10, "ids": ids(&[&pdf]) }),
+            "(async()=>{{const f=(a)=>window.__TAURI_INTERNALS__.invoke('quick_look_sync',a).then(v=>({{ok:v}}),e=>({{err:e}}));\
+             const newer=f({});const older=f({});const r=await Promise.all([newer,older]);\
+             location.hash='both='+encodeURIComponent(JSON.stringify(r));}})()",
             serde_json::json!({ "seq": newest + 11, "ids": ids(&[&text]) }),
+            serde_json::json!({ "seq": newest + 10, "ids": ids(&[&pdf]) }),
         );
         window.eval(&both).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline
-            && snapshot(&app).current_path.as_deref() != Some(image_path.as_str())
-        {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut settled = None;
+        while Instant::now() < deadline && settled.is_none() {
+            settled = window
+                .url()
+                .ok()
+                .and_then(|u| u.fragment().map(String::from))
+                .and_then(|f| f.strip_prefix("both=").map(urlencoding_decode));
             std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(300));
         let end = snapshot(&app);
         report.check(
-            "back-to-back syncs: the newest selection is what the panel shows",
-            end.current_path.as_deref() == Some(image_path.as_str()),
-            &end,
+            "older seq arriving after a newer one: both calls settled, the newest selection is shown",
+            settled.is_some()
+                && end.visible
+                && end.current_path.as_deref() == Some(image_path.as_str()),
+            &(&settled, &end),
         );
         seq.set(newest + 20);
         call(&window, "quick_look_toggle", args(&[])).unwrap();
