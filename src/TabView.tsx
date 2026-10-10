@@ -45,7 +45,9 @@ function SearchBanner({ search, scopeName, onClear }: { search: NonNullable<Tab[
       <span>
         {search.status === "gathering"
           ? "Results appear as Spotlight reports them."
-          : "Spotlight keeps this list up to date until you clear the search."}{" "}
+          : search.status === "limited"
+            ? "This search has ended and is no longer updated."
+            : "Spotlight keeps this list up to date until you clear the search."}{" "}
         {search.skipped > 0 &&
           `${search.skipped} match${search.skipped === 1 ? "" : "es"} were left out because the item no longer exists or could not be read. `}
         {search.limit !== null && `Stopped after ${search.limit} results; the list is incomplete. Narrow the search to see more. `}

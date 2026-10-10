@@ -21,10 +21,10 @@ export interface TabSearch {
   mode: SearchMode;
   /** The folder searched (with its descendants). */
   scopeId: string;
-  status: "gathering" | "live" | "failed";
+  status: "gathering" | "live" | "limited" | "failed";
   entries: FileEntry[];
   skipped: number;
-  /** Set when the result cap was reached: the list is incomplete by design. */
+  /** Set when the result cap was reached: the search ended (status "limited") and the list is incomplete by design. */
   limit: number | null;
   error: AppError | null;
 }
@@ -73,7 +73,6 @@ export type TabAction =
   | { type: "search-start"; tabId: string; query: string; mode: SearchMode }
   | { type: "search-clear"; tabId: string }
   | { type: "search-results"; tabId: string; key: number; entries: FileEntry[]; skipped: number }
-  | { type: "search-replace"; tabId: string; key: number; removeId: string; entry: FileEntry }
   | { type: "search-removed"; tabId: string; key: number; ids: string[] }
   | { type: "search-state"; tabId: string; key: number; state: "gathering" | "live" }
   | { type: "search-limited"; tabId: string; key: number; limit: number }
@@ -110,11 +109,6 @@ function restart(tab: Tab, history: hist.History, keepSelection: boolean): Tab {
     search: null,
   };
 }
-
-const fold = (text: string) => text.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
-
-/** Case- and diacritic-insensitive containment, like the native `CONTAINS[cd]` predicate. */
-export const nameMatches = (query: string, name: string) => fold(name).includes(fold(query));
 
 /** Applies a change to the tab's search only if the event still belongs to the live query. */
 function onSearch(state: TabsState, tabId: string, key: number, change: (s: TabSearch, tab: Tab) => Tab): TabsState {
@@ -193,7 +187,8 @@ export function tabsReducer(state: TabsState, action: TabAction): TabsState {
       return update(state, action.tabId, (tab) => {
         if (tab.nav !== action.nav || tab.listing.status !== "loading") return tab;
         const entries = tab.listing.entries;
-        let selection = prune(tab.selection, entries);
+        // A search list owns the selection; the folder underneath only refreshes.
+        let selection = tab.search ? tab.selection : prune(tab.selection, entries);
         const reveal = tab.reveal && entries.some((e) => e.id === tab.reveal) ? tab.reveal : null;
         if (reveal) selection = { ids: new Set([reveal]), anchor: reveal, focus: reveal };
         return { ...tab, selection, reveal: null, listing: { ...tab.listing, status: "ready" } };
@@ -250,21 +245,6 @@ export function tabsReducer(state: TabsState, action: TabAction): TabsState {
         }
         return { ...tab, search: { ...s, entries, skipped: s.skipped + action.skipped } };
       });
-    case "search-replace":
-      return onSearch(state, action.tabId, action.key, (s, tab) => {
-        // The renamed item is never added blindly: a filename search keeps it only if
-        // its new name still matches. Content does not change with a rename.
-        const keeps = s.mode === "content" || nameMatches(s.query, action.entry.name);
-        const entries = s.entries.filter((e) => e.id !== action.removeId && e.id !== action.entry.id);
-        if (keeps) entries.push(action.entry);
-        const ids = new Set(tab.selection.ids);
-        ids.delete(action.removeId);
-        if (keeps) ids.add(action.entry.id);
-        const selection = keeps
-          ? { ids, anchor: action.entry.id, focus: action.entry.id }
-          : prune({ ...tab.selection, ids }, entries);
-        return { ...tab, search: { ...s, entries }, selection };
-      });
     case "search-removed":
       return onSearch(state, action.tabId, action.key, (s, tab) => {
         const gone = new Set(action.ids);
@@ -274,10 +254,12 @@ export function tabsReducer(state: TabsState, action: TabAction): TabsState {
       });
     case "search-state":
       return onSearch(state, action.tabId, action.key, (s, tab) =>
-        s.status === "failed" || s.status === action.state ? tab : { ...tab, search: { ...s, status: action.state } },
+        s.status === "failed" || s.status === "limited" || s.status === action.state ? tab : { ...tab, search: { ...s, status: action.state } },
       );
     case "search-limited":
-      return onSearch(state, action.tabId, action.key, (s, tab) => ({ ...tab, search: { ...s, limit: action.limit } }));
+      return onSearch(state, action.tabId, action.key, (s, tab) =>
+        s.status === "failed" ? tab : { ...tab, search: { ...s, status: "limited", limit: action.limit } },
+      );
     case "search-failed":
       return onSearch(state, action.tabId, action.key, (s, tab) => ({
         ...tab,

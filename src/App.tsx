@@ -361,9 +361,10 @@ export default function App() {
       (entry) => {
         setNameState(null);
         if (current.searchKey !== null) {
-          // The renamed item stays in the list only if it still matches the query; its real
-          // folder is refreshed separately, and the search itself is kept.
-          dispatch({ type: "search-replace", tabId: current.tabId, key: current.searchKey, removeId: current.entry.id, entry });
+          // Spotlight alone decides whether the renamed item still matches: run the query
+          // again (no local guess) and refresh the item's real folder, keeping the search.
+          const t = stateRef.current.tabs.find((x) => x.id === current.tabId);
+          if (t?.search?.key === current.searchKey) dispatch({ type: "search-start", tabId: t.id, query: t.search.query, mode: t.search.mode });
           call("parent_directory", { id: entry.id }).then(
             (parent) => parent && reloadFolders([parent.id], undefined, true),
             () => undefined,

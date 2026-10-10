@@ -187,27 +187,32 @@ describe("tab search state", () => {
     expect(tabsReducer(s, { type: "search-results", tabId: "tab-9", key: 2, entries: [file("9")], skipped: 0 })).toBe(s);
   });
 
-  it("a rename never injects a non-matching item into a filename search", () => {
+  it("a terminal limit ends gathering and live states and ignores later state events", () => {
+    for (const first of ["gathering", "live"] as const) {
+      let s = start();
+      s = tabsReducer(s, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("1", "q")], skipped: 0 });
+      if (first === "live") s = tabsReducer(s, { type: "search-state", tabId: "tab-1", key: 1, state: "live" });
+      expect(s.tabs[0]!.search!.status).toBe(first);
+      s = tabsReducer(s, { type: "search-limited", tabId: "tab-1", key: 1, limit: 3 });
+      expect(s.tabs[0]!.search).toMatchObject({ status: "limited", limit: 3 });
+      expect(tabsReducer(s, { type: "search-state", tabId: "tab-1", key: 1, state: "gathering" })).toBe(s);
+      expect(tabsReducer(s, { type: "search-state", tabId: "tab-1", key: 1, state: "live" })).toBe(s);
+    }
+  });
+
+  it("a folder refresh under a search keeps the search selection and focus through reload, entries and finished", () => {
     let s = start();
-    s = tabsReducer(s, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("1", "q-a"), file("2", "q-b")], skipped: 0 });
-    s = tabsReducer(s, { type: "select", tabId: "tab-1", selection: { ids: new Set(["2"]), anchor: "2", focus: "2" } });
-    const miss = tabsReducer(s, { type: "search-replace", tabId: "tab-1", key: 1, removeId: "2", entry: file("3", "budget") });
-    expect(miss.tabs[0]!.search!.entries.map((e) => e.id)).toEqual(["1"]);
-    expect(miss.tabs[0]!.selection.ids.size).toBe(0);
-    // A later removal of the old id cannot touch anything else.
-    const after = tabsReducer(miss, { type: "search-removed", tabId: "tab-1", key: 1, ids: ["2"] });
-    expect(after.tabs[0]!.search!.entries.map((e) => e.id)).toEqual(["1"]);
-    const hit = tabsReducer(s, { type: "search-replace", tabId: "tab-1", key: 1, removeId: "2", entry: file("3", "Q-é") });
-    expect(hit.tabs[0]!.search!.entries.map((e) => e.id)).toEqual(["1", "3"]);
-    expect([...hit.tabs[0]!.selection.ids]).toEqual(["3"]);
-    // Stale query keys are ignored.
-    expect(tabsReducer(s, { type: "search-replace", tabId: "tab-1", key: 9, removeId: "2", entry: file("3", "q") })).toBe(s);
-    // Content searches match by text, which a rename does not change.
-    let c = tabsReducer(initialTabsState, { type: "open", location: loc });
-    c = tabsReducer(c, { type: "search-start", tabId: "tab-1", query: "needle", mode: "content" });
-    c = tabsReducer(c, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("1", "old")], skipped: 0 });
-    c = tabsReducer(c, { type: "search-replace", tabId: "tab-1", key: 1, removeId: "1", entry: file("1", "new") });
-    expect(c.tabs[0]!.search!.entries.map((e) => e.name)).toEqual(["new"]);
+    s = tabsReducer(s, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("d", "q-deep")], skipped: 0 });
+    s = tabsReducer(s, { type: "select", tabId: "tab-1", selection: { ids: new Set(["d"]), anchor: "d", focus: "d" } });
+    s = tabsReducer(s, { type: "reload", tabId: "tab-1", keepSearch: true });
+    const nav = s.tabs[0]!.nav;
+    s = tabsReducer(s, { type: "entries", tabId: "tab-1", nav, entries: [file("other")], failures: [] });
+    s = tabsReducer(s, { type: "finished", tabId: "tab-1", nav });
+    const tab = s.tabs[0]!;
+    expect(tab.listing.status).toBe("ready");
+    expect(tab.search?.entries.map((e) => e.id)).toEqual(["d"]);
+    expect([...tab.selection.ids]).toEqual(["d"]);
+    expect(tab.selection.focus).toBe("d");
   });
 
   it("refreshing the folder under a search keeps it only when asked", () => {

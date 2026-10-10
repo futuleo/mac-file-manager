@@ -210,14 +210,13 @@ contents (mode selector); Return starts, Escape or clearing the box cancels.
   batched), files are verified on a worker thread, and vanished or unreadable matches are counted
   as "left out". Live updates (new, changed, removed items) keep the list current until cleared.
   Large result sets continue in later main-queue turns (never inline, 500 results per turn). Reaching the result
-  limit or a failure ends the search: the worker itself releases the native query and
+  limit (state "limited": the list is final and no longer updated) or a failure ends the search: the worker itself releases the native query and
   unregisters the search, without waiting for another Spotlight notification.
 - **Results** use the original lossless ids: open file, open folder (navigates there), and
   "Show containing folder" (navigates to the real parent and selects the item). Copy, cut,
   rename and Move to the Trash work on the results' own ids; Paste and New folder are disabled in
   a result list because there is no single destination folder. After a file operation the search
-  is re-run; after a rename the item stays in a filename list only if its new name still contains
-  the query (content results keep it), the folder it lives in is refreshed, and the search is kept. Properties, Quick Look and dragging remain unavailable.
+  is re-run; after a rename the query is run again, so Spotlight alone decides whether the new name still matches (the list briefly restarts, and a just-renamed file may take a while to be re-indexed); the folder it lives in is refreshed and the search is kept. Properties, Quick Look and dragging remain unavailable.
 - **Honest limits**: Spotlight cannot say whether a folder is indexed, whether access was denied,
   or whether it finished, so the state is only *gathering* or *live*, there is no "complete", and
   "no matches" is worded as not proof of absence. Content search depends on installed

@@ -209,58 +209,60 @@ describe("search UI (mocked IPC)", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   }
 
-  it("a descendant renamed so it no longer matches leaves the filename results, and its folder is refreshed", async () => {
+  it("renaming a descendant re-runs the query natively instead of guessing, and refreshes its folder", async () => {
     await start();
     const args = await search("report");
     emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
     const readsBefore = reads.length;
     await rename("report.txt", "budget.txt");
     expect(called("rename_item")[0]!.args).toEqual({ id: nested.id, newName: "budget.txt" });
-    expect(screen.queryByText("report.txt")).toBeNull();
+    // The old query is cancelled and a fresh native one for the same text and mode starts.
+    await waitFor(() => expect(called("start_search").length).toBe(2));
+    expect(called("cancel_search")[0]!.args).toEqual({ searchId: args.searchId });
+    const again = called("start_search")[1]!.args as { searchId: string; query: string; mode: string; scopeId: string };
+    expect(again).toMatchObject({ query: "report", mode: "filename", scopeId: home.id });
+    expect(again.searchId).not.toBe(args.searchId);
+    // Nothing is shown until Spotlight reports; the renamed file is never admitted locally.
     expect(screen.queryByText("budget.txt")).toBeNull();
-    // The search is still the active one and was not restarted or cancelled.
-    expect(called("start_search").length).toBe(1);
-    expect(called("cancel_search").length).toBe(0);
-    // The old id disappearing later must not remove anything else or fail.
+    expect(screen.queryByText("report.txt")).toBeNull();
+    // A late removal of the old id from the old query changes nothing.
     emitSearch({ type: "removed", searchId: args.searchId, ids: [nested.id] });
     expect(box().value).toBe("report");
-    expect(called("parent_directory").some((c) => c.args.id === hex("/Users/me/Docs/deep/budget.txt"))).toBe(true);
+    await waitFor(() => expect(called("parent_directory").some((c) => c.args.id === hex("/Users/me/Docs/deep/budget.txt"))).toBe(true));
     expect(reads.length).toBe(readsBefore);
-  });
-
-  it("a descendant renamed to a still-matching name stays in the filename results", async () => {
-    await start();
-    const args = await search("report");
-    emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
-    await rename("report.txt", "Report-2.txt");
+    // Whatever the new query reports (here: a still-matching rename) is what is shown.
+    emitSearch({ type: "results", searchId: again.searchId, entries: [entry("/Users/me/Docs/deep/Report-2.txt")], skipped: 0 });
     expect(screen.getByText("Report-2.txt")).toBeTruthy();
-    expect(screen.queryByText("report.txt")).toBeNull();
   });
 
-  it("a direct child renamed to a non-match leaves the results but keeps the search and refreshes the folder", async () => {
+  it("renaming a direct child re-runs the search, keeps it, and reloads the folder", async () => {
     await start();
     const args = await search("report");
     emitSearch({ type: "results", searchId: args.searchId, entries: [direct], skipped: 0 });
     const readsBefore = reads.length;
     await rename("report-direct.txt", "budget-direct.txt");
-    expect(screen.queryByText("report-direct.txt")).toBeNull();
-    expect(screen.queryByText("budget-direct.txt")).toBeNull();
-    // The folder behind the search was reloaded; the search survived that reload.
+    await waitFor(() => expect(called("start_search").length).toBe(2));
     await waitFor(() => expect(reads.length).toBe(readsBefore + 1));
-    expect(called("start_search").length).toBe(1);
-    expect(called("cancel_search").length).toBe(0);
+    expect(screen.queryByText("budget-direct.txt")).toBeNull();
     expect(box().value).toBe("report");
-    emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
+    expect(called("cancel_search").length).toBe(1);
+    const again = called("start_search")[1]!.args as { searchId: string };
+    emitSearch({ type: "results", searchId: again.searchId, entries: [nested], skipped: 0 });
     expect(screen.getByText("report.txt")).toBeTruthy();
   });
 
-  it("content-mode results keep a renamed item, whose text did not change", async () => {
+  it("a limited search stops showing Searching or live maintenance", async () => {
     await start();
-    fireEvent.change(screen.getByLabelText("Search by"), { target: { value: "content" } });
-    const args = await search("needle");
-    expect(args.mode).toBe("content");
+    const args = await search("report");
     emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
-    await rename("report.txt", "budget.txt");
-    expect(screen.getByText("budget.txt")).toBeTruthy();
+    expect(screen.getByText(/Searching/)).toBeTruthy();
+    emitSearch({ type: "limited", searchId: args.searchId, limit: 1 });
+    expect(screen.queryByText(/Searching/)).toBeNull();
+    expect(screen.getByText(/Stopped after 1 results/)).toBeTruthy();
+    expect(screen.getByText(/no longer updated/)).toBeTruthy();
+    expect(screen.queryByText(/keeps this list up to date/)).toBeNull();
+    emitSearch({ type: "state", searchId: args.searchId, state: "live" });
+    expect(screen.queryByText(/keeps this list up to date/)).toBeNull();
+    expect(document.querySelector('[aria-busy="true"]')).toBeNull();
   });
 });
