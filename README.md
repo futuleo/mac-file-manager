@@ -8,7 +8,8 @@ locations, a virtualized details list (Name / Date modified / Type / Size) and a
 status bar, all wired to the real backend commands. **File operations** (new
 folder, copy, cut/paste move, rename, Move to the Trash) are implemented; see
 [File operations](#file-operations). **Spotlight search** of the current folder
-(filenames or contents) is implemented; see [Search](#search). Preview, Finder
+(filenames or contents) is implemented; see [Search](#search). **Quick Look** preview
+is implemented; see [Quick Look](#quick-look). Finder
 drag-and-drop, Properties and "Move to" are **not implemented**; their controls are shown
 disabled ("Not available yet").
 
@@ -115,8 +116,8 @@ only (API available), not exercised behavior; external dragging is untested.
 
 Limitations: "hidden" means a leading dot (the macOS hidden flag is not read);
 rows stay in directory order while a folder is still loading and are sorted
-when it finishes; Details is the only layout; properties and preview are disabled
-placeholders.
+when it finishes; Details is the only layout; properties is a disabled
+placeholder.
 
 ## Filesystem backend
 
@@ -247,7 +248,7 @@ and `ns_view()`, which provide the native handles later slices need.
 | Spotlight | `NSMetadataQuery` with search scopes and `NSPredicate` built from `predicateWithFormat:argumentArray:` (user text is a bound argument, never concatenated or shelled out). Filename: `kMDItemFSName CONTAINS[cd] %@`; content: `kMDItemTextContent CONTAINS[cd] %@`. Cancel with `stopQuery`. | Found an already-indexed file by name and by content; results were observable while still gathering; a freshly created fixture was found by both predicates after a delay (a first attempt in a dot-directory returned nothing within 20 s, so indexing latency is real and must be surfaced); `stopQuery` stopped the query |
 | Trash | `NSFileManager.trashItemAtURL:resultingItemURL:error:` | Moved a fixture to `~/.Trash`, source gone, resulting URL returned (the spike removed its own file afterwards) |
 | System icons | `NSWorkspace.iconForFile:` | Returned an `NSImage` |
-| Quick Look | `QLPreviewPanel.sharedPreviewPanel` with a Rust-defined `QLPreviewPanelDataSource` (`define_class!`) | In a standalone AppKit process the panel became visible with the expected item URL; `makeKeyAndOrderFront` and `setDataSource` were sufficient |
+| Quick Look | `QLPreviewPanel.sharedPreviewPanel` with a Rust-defined `QLPreviewPanelDataSource` (`define_class!`) | In a standalone AppKit process the panel became visible with the expected item URL; `makeKeyAndOrderFront` and `setDataSource` were sufficient. That spike alone did not prove Tauri integration; see [Quick Look](#quick-look) for the real window |
 | External drag source | `NSView.beginDraggingSessionWithItems:event:source:` with `NSURL` pasteboard writers on the webview's `NSView`; Tauri's built-in drag-drop only handles drops *into* the window | **Not exercised.** Bindings and `NSDraggingSession` exist, but a drag needs a live view and mouse event |
 
 Design consequences and limits:
@@ -309,3 +310,41 @@ fallback on one volume, not with a real second volume; no Full Disk Access is
 requested, so protected folders report permission errors; Trash and menu
 behavior have been checked by automated tests with owned temporary fixtures,
 see the PR for GUI acceptance evidence. Copies preserve extended attributes, ACLs and mode on a best-effort basis (failures to copy this metadata are not reported).
+
+## Quick Look
+
+Space, the ribbon **Preview** button, the context menu's **Quick Look** item and
+File > **Quick Look** toggle the system Quick Look panel (`QLPreviewPanel`) for the
+active tab's selection, in ordinary folders and in search results. The system's own
+providers render the content (images, PDF, text and whatever else macOS supports); the
+app does not render previews itself and nothing is embedded in the window.
+
+- Backend: `quick_look_toggle` / `quick_look_sync` (`src-tauri/src/quick_look.rs`). The ids
+  are the lossless `FileEntry` ids; each is resolved and checked (exists, not a FIFO or device,
+  openable) on every call, 1 to 50 items. Errors are typed (`invalidInput`, `notFound`,
+  `permissionDenied`, `unsupported`) and shown in the tab's error banner; nothing is falsely
+  reported as shown.
+- Native integration: a Rust-defined `NSResponder` subclass is inserted after the Tauri
+  `NSWindow` in its responder chain and answers the panel's `acceptsPreviewPanelControl:` /
+  `beginPreviewPanelControl:` / `endPreviewPanelControl:` protocol as data source. All AppKit
+  calls run on the main thread, only the calling window can control its own panel, and the
+  controller is detached and released when the window is destroyed.
+- While open, the panel follows the selection (and active tab / search query); an empty
+  selection closes it. A file that disappears, is renamed or Trashed closes it and reports
+  `notFound`. Navigation clears the selection and so closes it.
+- Space only acts when the file list itself has focus, so typing in the address, search or
+  name fields is untouched; the native menu item has no accelerator so Space cannot trigger twice.
+
+Verification and limits:
+
+- `cargo run --locked --example quick_look_acceptance` builds a real Tauri runtime with a real
+  `NSWindow` and `WKWebView`, calls the commands through the webview's IPC, and reads back the
+  `QLPreviewPanel` state (visible, owned by this window's controller, item count and URL) for
+  owned temporary image, PDF and text fixtures, including selection change, empty selection,
+  vanished file, toggle-close, malformed ids and window close. It needs a logged-in GUI session.
+- It verifies panel state, **not rendered pixels**: screen capture and accessibility automation
+  are not available here, so what the panel visually shows is unverified. Real Space-key
+  delivery through the WebView, and the panel's own keyboard handling, were not exercised by
+  automation.
+- Cargo/Vitest tests use the Tauri mock runtime (no `NSWindow`) and a mocked `invoke`; they cover
+  argument validation, typed errors and UI wiring only.

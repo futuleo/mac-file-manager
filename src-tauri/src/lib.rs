@@ -4,6 +4,7 @@ pub mod filesystem;
 mod macos;
 mod menu;
 pub mod operations;
+pub mod quick_look;
 pub mod search;
 /// Owned scratch directories for the `examples/` spikes and unit tests.
 pub mod spike_fixture;
@@ -175,6 +176,26 @@ fn start_directory_read<R: Runtime>(
         );
     });
     Ok(())
+}
+
+/// Shows or hides the system Quick Look panel for the calling window. Returns
+/// whether the preview is showing afterwards.
+#[tauri::command]
+async fn quick_look_toggle<R: Runtime>(
+    window: WebviewWindow<R>,
+    ids: Vec<String>,
+) -> Result<bool, AppError> {
+    quick_look::toggle(&window, ids).await
+}
+
+/// Applies the current selection to a preview the calling window has open (no-op
+/// otherwise). Returns whether a preview is showing afterwards.
+#[tauri::command]
+async fn quick_look_sync<R: Runtime>(
+    window: WebviewWindow<R>,
+    ids: Vec<String>,
+) -> Result<bool, AppError> {
+    quick_look::sync(&window, ids).await
 }
 
 /// Idempotent: cancelling a finished or unknown read is not an error.
@@ -552,7 +573,8 @@ fn release_search<R: Runtime>(app: &tauri::AppHandle<R>, session: &search::Sessi
 }
 
 /// State and command registration, shared by the app and the mock-runtime tests.
-fn register<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+#[doc(hidden)]
+pub fn register<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
         .manage(Arc::new(DirectoryReads::default()))
         .manage(Arc::new(Tasks::default()))
@@ -575,7 +597,9 @@ fn register<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             create_folder,
             rename_item,
             start_search,
-            cancel_search
+            cancel_search,
+            quick_look_toggle,
+            quick_look_sync
         ])
 }
 
@@ -587,6 +611,7 @@ pub fn run() {
             // Closing the window releases every native query it still owns.
             if let tauri::WindowEvent::Destroyed = event {
                 let app = window.app_handle();
+                quick_look::release(app, window.label().to_string());
                 for (id, session) in app.state::<Arc<Searches>>().take_all() {
                     release_search(app, &session, id);
                 }
@@ -721,6 +746,19 @@ mod tests {
 
         fn is_terminal(e: &Value) -> bool {
             e["type"] != "entries"
+        }
+
+        #[test]
+        fn quick_look_commands_are_registered_and_reject_malformed_arguments() {
+            // MOCK runtime: it has no real NSWindow, so this only covers command
+            // registration and argument deserialization, never native panel
+            // behavior (see examples/quick_look_acceptance.rs for that).
+            let (_app, window) = app();
+            for command in ["quick_look_toggle", "quick_look_sync"] {
+                assert!(invoke(&window, command, json!({})).is_err());
+                assert!(invoke(&window, command, json!({ "ids": "a" })).is_err());
+                assert!(invoke(&window, command, json!({ "ids": [1] })).is_err());
+            }
         }
 
         #[test]

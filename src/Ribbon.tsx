@@ -17,6 +17,8 @@ interface Props {
   onRename(): void;
   onNewFolder(): void;
   onOpen(): void;
+  canQuickLook: boolean;
+  onQuickLook(): void;
   onSelectAll(): void;
   onSelectNone(): void;
   onInvert(): void;
@@ -100,6 +102,7 @@ export default function Ribbon(props: Props) {
             </Group>
             <Group label="Open">
               <Command label="Open" disabled={!props.canOpen} onClick={props.onOpen} />
+              <Command label="Preview" disabled={!props.canQuickLook} onClick={props.onQuickLook} title="Quick Look (Space)" />
             </Group>
             <Group label="Select">
               <Command label="Select all" disabled={!props.canSelect} onClick={props.onSelectAll} />

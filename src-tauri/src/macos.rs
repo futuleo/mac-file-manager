@@ -45,7 +45,7 @@ fn file_url(path: &Path) -> Option<Retained<NSURL>> {
     file_url_with(path, false)
 }
 
-fn file_url_with(path: &Path, is_directory: bool) -> Option<Retained<NSURL>> {
+pub(crate) fn file_url_with(path: &Path, is_directory: bool) -> Option<Retained<NSURL>> {
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
     let ptr = std::ptr::NonNull::new(c_path.as_ptr() as *mut _)?;
     // SAFETY: `ptr` is a valid NUL-terminated string that outlives the call;

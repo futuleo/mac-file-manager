@@ -65,6 +65,8 @@ export default function App() {
   const selectionRef = useRef<Selection>(emptySelection);
   const rowsRef = useRef<FileEntry[]>([]);
   const [clipboard, setClipboard] = useState<Clipboard | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const previewSerial = useRef(0);
   const [nameState, setNameState] = useState<NameState | null>(null);
 
   // Reload only the tabs showing a changed folder; `reveal` selects an item in one tab.
@@ -285,6 +287,28 @@ export default function App() {
 
   const selectedEntries = () => rowsRef.current.filter((e) => selectionRef.current.ids.has(e.id));
 
+  const previewIds = () => selectedEntries().map((e) => e.id);
+
+  // Quick Look shows the selection in the native panel; the backend's answer says whether it is open.
+  const togglePreview = () => {
+    const t = activeTab(stateRef.current);
+    const ids = previewIds();
+    if (!t) return;
+    if (ids.length === 0 && !previewOpen) {
+      setAnnouncement("Select an item to preview.");
+      return;
+    }
+    const serial = ++previewSerial.current;
+    call("quick_look_toggle", { ids }).then(
+      (open) => serial === previewSerial.current && setPreviewOpen(open),
+      (reason) => {
+        if (serial !== previewSerial.current) return;
+        setPreviewOpen(false);
+        dispatch({ type: "action-error", tabId: t.id, error: toAppError(reason, "preview the selection") });
+      },
+    );
+  };
+
   const copySelection = (mode: Clipboard["mode"]) => {
     const ids = selectedEntries().map((e) => e.id);
     if (ids.length === 0) return;
@@ -393,7 +417,7 @@ export default function App() {
       if (id === "select-all") (el as HTMLInputElement).select?.();
       return;
     }
-    if (editing && (id === "trash" || id === "rename" || id === "new-folder")) return;
+    if (editing && (id === "trash" || id === "rename" || id === "new-folder" || id === "quick-look")) return;
     if (nameState || operations.operations.some((op) => op.conflict)) return;
     switch (id) {
       case "new-tab": return newTab();
@@ -414,6 +438,7 @@ export default function App() {
       case "cut": return copySelection("cut");
       case "paste": return pasteHere();
       case "rename": return beginRename();
+      case "quick-look": return togglePreview();
       case "trash": return trashSelection();
       case "hidden-items": return setShowHidden(!prefs.showHidden);
     }
@@ -432,6 +457,23 @@ export default function App() {
       unlisten?.();
     };
   }, []);
+
+  // While the panel is open it follows the active tab's selection (and its query); a
+  // reply for an older selection is ignored, and an empty selection closes it.
+  const previewKey = previewOpen ? rows.filter((e) => selection.ids.has(e.id)).map((e) => e.id).join("\0") : "";
+  useEffect(() => {
+    if (!previewOpen) return;
+    const tabId = activeId;
+    const serial = ++previewSerial.current;
+    call("quick_look_sync", { ids: previewKey ? previewKey.split("\0") : [] }).then(
+      (open) => serial === previewSerial.current && !open && setPreviewOpen(false),
+      (reason) => {
+        if (serial !== previewSerial.current) return;
+        setPreviewOpen(false);
+        if (tabId) dispatch({ type: "action-error", tabId, error: toAppError(reason, "preview the selection") });
+      },
+    );
+  }, [previewOpen, previewKey, activeId, tab?.search?.key]);
 
   // Announce load outcomes for screen readers.
   const status = tab?.listing.status;
@@ -465,6 +507,8 @@ export default function App() {
         items.push({ label: "Show containing folder", onSelect: () => showContaining(tab.id, entry) });
       }
       items.push(
+        { separator: true },
+        { label: "Quick Look", shortcut: "Space", onSelect: togglePreview },
         { separator: true },
         { label: "Cut", shortcut: "⌘X", onSelect: () => copySelection("cut") },
         { label: "Copy", shortcut: "⌘C", onSelect: () => copySelection("copy") },
@@ -551,6 +595,8 @@ export default function App() {
         onRename={beginRename}
         onNewFolder={newFolder}
         onOpen={openFocused}
+        canQuickLook={selection.ids.size > 0}
+        onQuickLook={togglePreview}
         onSelectAll={selectAllRows}
         onSelectNone={() => select(emptySelection)}
         onInvert={() => activeId && dispatch({ type: "select", tabId: activeId, selection: invert(rows, selection) })}
@@ -648,6 +694,7 @@ export default function App() {
                   onActivate={(entry) => openEntry(tab.id, entry)}
                   onContextMenu={openItemMenu}
                   onRename={beginRename}
+                  onQuickLook={togglePreview}
                   onRetry={() => dispatch({ type: "reload", tabId: tab.id })}
                   onBack={() => dispatch({ type: "back", tabId: tab.id })}
                   onDismissAction={() => dispatch({ type: "action-error", tabId: tab.id, error: null })}
