@@ -11,11 +11,13 @@ import { resetIconQueueForTests } from "./iconQueue";
 type Listener = (e: { payload: unknown }) => void;
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
+  rejectTaskListener: false,
   listeners: [] as { name: string; cb: (e: { payload: unknown }) => void }[],
 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async (name: string, cb: Listener) => {
+    if (mocks.rejectTaskListener && name === TASK_EVENT) throw new Error("listen refused");
     const record = { name, cb };
     mocks.listeners.push(record);
     return () => {
@@ -65,13 +67,14 @@ const finishRead = (readId: string, entries: FileEntry[]) =>
 const called = (command: string) => calls.filter((c) => c.command === command);
 const taskId = (command: string) => called(command)[0]!.args.taskId as string;
 const rowFor = (name: string) => screen.getByText(name).closest('[role="row"]') as HTMLElement;
-const emptyTotals = { succeeded: 0, skipped: 0, failed: [], failedOmitted: 0, affected: [] as string[] };
+const emptyTotals = { succeeded: 0, skipped: 0, failed: [], failedOmitted: 0, affected: [] as string[], partial: [] as string[] };
 
 beforeEach(() => {
   reads = [];
   calls = [];
   failCommand = {};
   mocks.listeners = [];
+  mocks.rejectTaskListener = false;
   localStorage.clear();
   resetIconQueueForTests();
   mocks.invoke.mockImplementation(async (command: string, args: Record<string, unknown>) => {
@@ -231,6 +234,32 @@ describe("file operations UI (mocked IPC)", () => {
     await waitFor(() => expect(called("cancel_task")[0]!.args).toEqual({ taskId: id }));
     emitTask({ type: "cancelled", taskId: id, ...emptyTotals, succeeded: 1, affected: [home.id] });
     expect(await within(region).findByText(/Cancelled\..*already done was not undone/)).toBeTruthy();
+  });
+
+  it("discloses a folder left only partly copied when the cancelled task completed no top-level item", async () => {
+    await start();
+    select("a.txt");
+    menu("copy");
+    menu("paste");
+    await waitFor(() => expect(called("start_transfer").length).toBe(1));
+    const id = taskId("start_transfer");
+    emitTask({ type: "cancelled", taskId: id, ...emptyTotals, partial: ["/Users/me/a-copy"], affected: [home.id] });
+    const region = screen.getByRole("region", { name: "File operations" });
+    expect(await within(region).findByText(/1 folder was only partly copied.*nothing was rolled back.*not undone/)).toBeTruthy();
+  });
+
+  it("fails closed when the operation event listener cannot be registered", async () => {
+    mocks.rejectTaskListener = true;
+    await start();
+    select("a.txt", "b.txt");
+    menu("trash");
+    const region = screen.getByRole("region", { name: "File operations" });
+    expect(await within(region).findByText(/Could not listen for operation progress/)).toBeTruthy();
+    menu("copy");
+    menu("paste");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(called("trash_items").length).toBe(0);
+    expect(called("start_transfer").length).toBe(0);
   });
 
   it("lists partial failures and the omitted count", async () => {

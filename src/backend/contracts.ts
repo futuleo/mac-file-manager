@@ -80,6 +80,8 @@ export interface TaskSummary {
   failed: ItemFailure[];
   failedOmitted: number;
   affected: string[];
+  /** Folder ids left only partly copied by a cancellation or failure; nothing was rolled back. */
+  partial: string[];
 }
 
 /** A task ends with exactly one of `finished`, `cancelled` or `failed`. Cancelling never rolls back finished items. */

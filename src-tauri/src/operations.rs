@@ -15,7 +15,7 @@
 //!   tested against temporary fixtures without a window.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     ffi::{CString, OsStr},
     fs::{self, File, Metadata, OpenOptions},
     io::{self, Read, Write},
@@ -305,6 +305,28 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// Atomically exchanges two existing paths.
+#[cfg(target_os = "macos")]
+fn rename_swap(a: &Path, b: &Path) -> io::Result<()> {
+    let cstr = |p: &Path| {
+        CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
+    };
+    let (a, b) = (cstr(a)?, cstr(b)?);
+    // SAFETY: both pointers are valid NUL-terminated strings for the call.
+    let rc = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rename_swap(_: &Path, _: &Path) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 #[cfg(not(target_os = "macos"))]
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     let _ = CString::new("");
@@ -358,7 +380,39 @@ enum Node {
     Failed,
 }
 
-type Copied = Vec<(PathBuf, bool)>;
+/// Identity and version of an item at the moment it was copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+impl Stamp {
+    fn of(meta: &Metadata) -> Self {
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.len(),
+            mtime: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+            ctime: meta.ctime(),
+            ctime_nsec: meta.ctime_nsec(),
+        }
+    }
+}
+
+struct CopiedItem {
+    path: PathBuf,
+    is_dir: bool,
+    stamp: Stamp,
+}
+
+type Copied = Vec<CopiedItem>;
 
 fn entry_kind(meta: &Metadata) -> EntryKind {
     if meta.is_dir() {
@@ -382,6 +436,8 @@ struct Run<'a> {
     skipped: u64,
     failed: Vec<ItemFailure>,
     omitted: u64,
+    /// Top-level folders left incomplete (cancelled or failed mid-copy).
+    partial: Vec<PathBuf>,
     affected: BTreeSet<PathBuf>,
     total_bytes: u64,
     done_bytes: u64,
@@ -409,6 +465,7 @@ impl<'a> Run<'a> {
             skipped: 0,
             failed: Vec::new(),
             omitted: 0,
+            partial: Vec::new(),
             affected: BTreeSet::new(),
             total_bytes: 0,
             done_bytes: 0,
@@ -479,6 +536,7 @@ impl<'a> Run<'a> {
             skipped: self.skipped,
             failed: std::mem::take(&mut self.failed),
             failed_omitted: self.omitted,
+            partial: self.partial.iter().map(|p| path_to_id(p)).collect(),
             affected: self.affected.iter().map(|p| path_to_id(p)).collect(),
         }
     }
@@ -633,8 +691,15 @@ impl<'a> Run<'a> {
                             target = unique_name(dest_dir, &name, meta.is_dir());
                         }
                         ConflictDecision::Replace => {
-                            self.replace(mode, source, &target, dest_dir, size)?;
-                            return Ok(());
+                            let approved = (existing.dev(), existing.ino());
+                            if self.replace(mode, source, &target, dest_dir, size, approved)? {
+                                return Ok(());
+                            }
+                            // The destination changed after the user answered: the
+                            // consent no longer applies, so ask again.
+                            if self.remembered == Some(ConflictDecision::Replace) {
+                                self.remembered = None;
+                            }
                         }
                     }
                 }
@@ -720,21 +785,54 @@ impl<'a> Run<'a> {
         Ok(true)
     }
 
+    /// Removes only entries that are still exactly what was copied (same
+    /// identity and version, under unchanged copied folders). Anything edited or
+    /// replaced since is kept and reported.
     fn remove_copied_sources(&mut self, copied: Copied, before: usize) {
-        for (path, is_dir) in copied {
-            let result = if is_dir {
-                fs::remove_dir(&path)
+        let dirs: HashMap<PathBuf, (u64, u64)> = copied
+            .iter()
+            .filter(|c| c.is_dir)
+            .map(|c| (c.path.clone(), (c.stamp.dev, c.stamp.ino)))
+            .collect();
+        for item in copied {
+            let path = &item.path;
+            let unchanged = fs::symlink_metadata(path).is_ok_and(|now| {
+                if item.is_dir {
+                    now.is_dir() && (now.dev(), now.ino()) == (item.stamp.dev, item.stamp.ino)
+                } else {
+                    !now.is_dir() && Stamp::of(&now) == item.stamp
+                }
+            }) && path.ancestors().skip(1).all(|ancestor| {
+                dirs.get(ancestor).is_none_or(|id| {
+                    fs::symlink_metadata(ancestor)
+                        .is_ok_and(|m| m.is_dir() && (m.dev(), m.ino()) == *id)
+                })
+            });
+            if !unchanged {
+                self.fail_msg(
+                    path,
+                    ErrorCategory::Io,
+                    format!(
+                        "\"{}\" changed after it was copied, so the original was kept; \
+                         it exists in both places.",
+                        display_name(path)
+                    ),
+                );
+                continue;
+            }
+            let result = if item.is_dir {
+                fs::remove_dir(path)
             } else {
-                fs::remove_file(&path)
+                fs::remove_file(path)
             };
             if let Err(e) = result {
-                let name = display_name(&path);
-                let mut app = AppError::from_io(self.operation, &path, &e);
+                let name = display_name(path);
+                let mut app = AppError::from_io(self.operation, path, &e);
                 app.message = format!(
                     "\"{name}\" was copied but the original could not be removed ({e}); \
                      it exists in both places."
                 );
-                self.fail(&path, app);
+                self.fail(path, app);
             }
         }
         if self.failure_count() == before {
@@ -742,9 +840,11 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// Replaces a file or link: the new item is fully written under a temporary
-    /// name first, then the old item goes to the Trash and the new one takes its
-    /// place. If the old item cannot be trashed nothing is changed.
+    /// Replaces the file or link that the user approved (`approved` is its
+    /// device/inode). The new item is fully written under a temporary name, then
+    /// atomically swapped into place; the displaced item is checked to be the
+    /// approved one (otherwise the swap is undone) before it goes to the Trash.
+    /// `Ok(false)` means the destination changed and must be decided again.
     fn replace(
         &mut self,
         mode: TransferMode,
@@ -752,13 +852,12 @@ impl<'a> Run<'a> {
         target: &Path,
         dest_dir: &Path,
         size: u64,
-    ) -> Flow {
+        approved: (u64, u64),
+    ) -> Flow<bool> {
         self.temporaries += 1;
-        let temporary = dest_dir.join(format!(
-            ".mfm-replace-{}-{}.tmp",
-            std::process::id(),
-            self.temporaries
-        ));
+        let stem = format!(".mfm-replace-{}-{}", std::process::id(), self.temporaries);
+        let temporary = dest_dir.join(format!("{stem}.tmp"));
+        let holder = dest_dir.join(format!("{stem}.old"));
         let before = self.failure_count();
         let mut copied: Option<Copied> = Some(Vec::new());
         match self.copy_node(source, &temporary, true, &mut copied)? {
@@ -773,27 +872,55 @@ impl<'a> Run<'a> {
                 } else {
                     let _ = fs::remove_file(&temporary);
                 }
-                return Ok(());
+                return Ok(true);
             }
         }
-        if let Err(error) = self.trash.trash(target) {
+        if let Err(e) = rename_swap(&temporary, target) {
             let _ = fs::remove_file(&temporary);
-            self.fail(source, error);
-            return Ok(());
+            if e.kind() == io::ErrorKind::NotFound {
+                return Ok(false);
+            }
+            self.fail_io(target, &e);
+            return Ok(true);
         }
-        if let Err(e) = rename_noreplace(&temporary, target) {
-            let _ = fs::remove_file(&temporary);
+        // `temporary` now holds whatever was at `target`.
+        let displaced = fs::symlink_metadata(&temporary);
+        if !displaced
+            .as_ref()
+            .is_ok_and(|m| !m.is_dir() && (m.dev(), m.ino()) == approved)
+        {
+            let restored = self.undo_swap(&temporary, target, source);
+            return Ok(!restored);
+        }
+        let held = target
+            .file_name()
+            .map(|name| holder.join(name))
+            .filter(|_| fs::create_dir(&holder).is_ok());
+        let Some(held) = held else {
+            self.undo_swap(&temporary, target, source);
             self.fail_msg(
                 source,
                 ErrorCategory::Io,
-                format!(
-                    "The previous \"{}\" was moved to the Trash but its replacement could not be \
-                     put in place ({e}). The original source was kept.",
-                    display_name(target)
-                ),
+                "Could not prepare to replace the item; nothing was changed.",
             );
-            return Ok(());
+            return Ok(true);
+        };
+        if let Err(e) = rename_noreplace(&temporary, &held) {
+            let _ = fs::remove_dir(&holder);
+            self.undo_swap(&temporary, target, source);
+            self.fail_io(target, &e);
+            return Ok(true);
         }
+        if let Err(error) = self.trash.trash(&held) {
+            // Put the old item back; the new one returns to the held name and goes away.
+            if rename_swap(target, &held).is_ok() {
+                let _ = fs::remove_file(&held);
+            }
+            let _ = fs::remove_dir(&holder);
+            self.fail(source, error);
+            return Ok(true);
+        }
+        let _ = fs::remove_dir(&holder);
         if mode == TransferMode::Move {
             self.remove_copied_sources(copied.unwrap_or_default(), before);
             if let Some(parent) = source.parent() {
@@ -805,7 +932,29 @@ impl<'a> Run<'a> {
         self.done_items += 1;
         self.done_bytes += size;
         self.progress(false);
-        Ok(())
+        Ok(true)
+    }
+
+    /// Reverses the swap after the displaced item turned out not to be the
+    /// approved one. Returns `true` when the original was restored and the
+    /// conflict must be asked again.
+    fn undo_swap(&mut self, temporary: &Path, target: &Path, source: &Path) -> bool {
+        if rename_swap(temporary, target).is_ok() {
+            let _ = fs::remove_file(temporary);
+            true
+        } else {
+            self.fail_msg(
+                source,
+                ErrorCategory::Io,
+                format!(
+                    "\"{}\" changed while it was being replaced and could not be restored \
+                     automatically; the item that was there is now named \"{}\".",
+                    display_name(target),
+                    display_name(temporary)
+                ),
+            );
+            false
+        }
     }
 
     // ------------------------------------------------------------ copy
@@ -830,7 +979,11 @@ impl<'a> Run<'a> {
             let result = fs::read_link(src).and_then(|link| std::os::unix::fs::symlink(link, dst));
             let node = self.created(result, src, top, || {
                 if let Some(list) = copied {
-                    list.push((src.to_path_buf(), false));
+                    list.push(CopiedItem {
+                        path: src.to_path_buf(),
+                        is_dir: false,
+                        stamp: Stamp::of(&meta),
+                    });
                 }
             });
             return Ok(node);
@@ -884,6 +1037,41 @@ impl<'a> Run<'a> {
         if created != Node::Done {
             return Ok(created);
         }
+        let clean = match self.copy_children(src, dst, copied) {
+            Ok(clean) => clean,
+            Err(cancelled) => {
+                if top {
+                    self.partial.push(dst.to_path_buf());
+                }
+                return Err(cancelled);
+            }
+        };
+        // Applied last so a read-only source folder can still be filled.
+        if let Ok(dir) = File::open(dst) {
+            let _ = dir.set_permissions(meta.permissions());
+            if let Ok(modified) = meta.modified() {
+                let _ = dir.set_modified(modified);
+            }
+        }
+        if clean {
+            if let Some(list) = copied {
+                list.push(CopiedItem {
+                    path: src.to_path_buf(),
+                    is_dir: true,
+                    stamp: Stamp::of(meta),
+                });
+            }
+            Ok(Node::Done)
+        } else {
+            if top {
+                self.partial.push(dst.to_path_buf());
+            }
+            Ok(Node::Failed)
+        }
+    }
+
+    /// Copies the entries of `src` into the existing folder `dst`; `false` if any failed.
+    fn copy_children(&mut self, src: &Path, dst: &Path, copied: &mut Option<Copied>) -> Flow<bool> {
         let mut clean = true;
         match fs::read_dir(src) {
             Err(e) => {
@@ -908,21 +1096,7 @@ impl<'a> Run<'a> {
                 }
             }
         }
-        // Applied last so a read-only source folder can still be filled.
-        if let Ok(dir) = File::open(dst) {
-            let _ = dir.set_permissions(meta.permissions());
-            if let Ok(modified) = meta.modified() {
-                let _ = dir.set_modified(modified);
-            }
-        }
-        if clean {
-            if let Some(list) = copied {
-                list.push((src.to_path_buf(), true));
-            }
-            Ok(Node::Done)
-        } else {
-            Ok(Node::Failed)
-        }
+        Ok(clean)
     }
 
     fn copy_file(
@@ -996,10 +1170,13 @@ impl<'a> Run<'a> {
             self.fail_io(src, &e);
             return Ok(Node::Failed);
         }
-        let unchanged = input.metadata().is_ok_and(|after| {
+        let after = input.metadata().ok();
+        let unchanged = after.as_ref().is_some_and(|after| {
             after.len() == before.len()
                 && after.mtime() == before.mtime()
                 && after.mtime_nsec() == before.mtime_nsec()
+                && after.ctime() == before.ctime()
+                && after.ctime_nsec() == before.ctime_nsec()
         }) && written == before.len();
         if !unchanged {
             drop(output);
@@ -1019,8 +1196,12 @@ impl<'a> Run<'a> {
         if let Ok(modified) = before.modified() {
             let _ = output.set_modified(modified);
         }
-        if let Some(list) = copied {
-            list.push((src.to_path_buf(), false));
+        if let (Some(list), Some(after)) = (copied, after.as_ref()) {
+            list.push(CopiedItem {
+                path: src.to_path_buf(),
+                is_dir: false,
+                stamp: Stamp::of(after),
+            });
         }
         Ok(Node::Done)
     }

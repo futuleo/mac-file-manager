@@ -158,6 +158,8 @@ pub struct TaskSummary {
     pub skipped: u64,
     pub failed: Vec<ItemFailure>,
     pub failed_omitted: u64,
+    /// Folders left only partly copied (cancelled or failed midway) and not rolled back.
+    pub partial: Vec<String>,
     pub affected: Vec<String>,
 }
 
@@ -392,6 +394,7 @@ mod tests {
                     },
                 }],
                 failed_omitted: 0,
+                partial: vec![],
                 affected: vec!["2f".into()],
             },
         };

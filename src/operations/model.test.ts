@@ -9,7 +9,7 @@ import {
   resultMessage,
 } from "./model";
 
-const totals = { succeeded: 0, skipped: 0, failed: [], failedOmitted: 0, affected: [] as string[] };
+const totals = { succeeded: 0, skipped: 0, failed: [], failedOmitted: 0, affected: [] as string[], partial: [] as string[] };
 const base = () => newOperation("t1", "copy", "Copying", 3, "tab-1");
 
 describe("operations model", () => {
@@ -34,6 +34,22 @@ describe("operations model", () => {
     expect(text).toContain("1 item could not be copied.");
     expect(text).toContain("not undone");
     expect(needsAttention(op!)).toBe(true);
+  });
+
+  it("discloses partly copied folders even when no top-level item succeeded", () => {
+    const [op] = operationsReducer([base()], {
+      type: "event",
+      event: { type: "cancelled", taskId: "t1", ...totals, partial: ["a", "b"] },
+    });
+    const text = resultMessage(op!);
+    expect(text).toContain("2 folders were only partly copied and left in place; nothing was rolled back.");
+    expect(text).toContain("not undone");
+    expect(needsAttention(op!)).toBe(true);
+    const [done] = operationsReducer([base()], {
+      type: "event",
+      event: { type: "finished", taskId: "t1", ...totals, succeeded: 1, partial: ["a"] },
+    });
+    expect(needsAttention(done!)).toBe(true);
   });
 
   it("only reports measured progress", () => {

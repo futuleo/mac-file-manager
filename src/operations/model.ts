@@ -155,16 +155,21 @@ export function resultMessage(op: Operation): string {
   const result = op.result;
   if (!result) return op.title;
   if (result.state === "failed") return result.error.message;
-  const { succeeded, skipped, failed, failedOmitted } = result.summary;
+  const { succeeded, skipped, failed, failedOmitted, partial } = result.summary;
   const failures = failed.length + failedOmitted;
   const parts: string[] = [];
   if (op.kind === "trash") parts.push(`${DONE.trash} ${plural(succeeded, "item")}.`);
   else parts.push(`${DONE[op.kind]} ${succeeded} of ${plural(op.itemCount, "item")}.`);
   if (skipped > 0) parts.push(`${plural(skipped, "item")} skipped.`);
   if (failures > 0) parts.push(`${plural(failures, "item")} could not be ${FAILED[op.kind]}.`);
-  if (result.state === "cancelled") {
-    parts.unshift("Cancelled.");
-    if (succeeded > 0) parts.push("Work that was already done was not undone.");
+  if (partial.length > 0) {
+    parts.push(
+      `${plural(partial.length, "folder")} ${partial.length === 1 ? "was" : "were"} only partly ${FAILED[op.kind]} and left in place; nothing was rolled back.`,
+    );
+  }
+  if (result.state === "cancelled") parts.unshift("Cancelled.");
+  if (result.state === "cancelled" && (succeeded > 0 || partial.length > 0)) {
+    parts.push("Work that was already done was not undone.");
   }
   return parts.join(" ");
 }
@@ -174,7 +179,7 @@ export function needsAttention(op: Operation): boolean {
   const result = op.result;
   if (!result) return false;
   if (result.state !== "finished") return true;
-  return result.summary.failed.length > 0 || result.summary.failedOmitted > 0 || result.summary.skipped > 0;
+  return result.summary.failed.length > 0 || result.summary.failedOmitted > 0 || result.summary.skipped > 0 || result.summary.partial.length > 0;
 }
 
 export function formatBytes(bytes: number): string {

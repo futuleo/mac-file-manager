@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
     },
 };
 
@@ -15,6 +15,8 @@ use crate::spike_fixture::Fixture;
 
 struct Ctl {
     cancelled: AtomicBool,
+    /// Cancels once this many cancellation checks have happened (deterministic).
+    countdown: AtomicI64,
     events: Mutex<Vec<TaskEvent>>,
     answer: Box<dyn Fn(&ConflictPrompt) -> Option<Resolution> + Send + Sync>,
     prompts: Mutex<Vec<ConflictPrompt>>,
@@ -24,6 +26,7 @@ impl Ctl {
     fn new(answer: impl Fn(&ConflictPrompt) -> Option<Resolution> + Send + Sync + 'static) -> Self {
         Self {
             cancelled: AtomicBool::new(false),
+            countdown: AtomicI64::new(i64::MAX),
             events: Mutex::new(Vec::new()),
             answer: Box::new(answer),
             prompts: Mutex::new(Vec::new()),
@@ -78,6 +81,9 @@ impl Ctl {
 
 impl TaskControl for Ctl {
     fn is_cancelled(&self) -> bool {
+        if self.countdown.fetch_sub(1, Ordering::Relaxed) <= 0 {
+            self.cancelled.store(true, Ordering::Relaxed);
+        }
         self.cancelled.load(Ordering::Relaxed)
     }
     fn emit(&self, event: TaskEvent) {
@@ -97,7 +103,11 @@ struct FakeTrash {
 
 impl Trasher for FakeTrash {
     fn trash(&self, path: &Path) -> Result<Option<PathBuf>, AppError> {
-        if self.deny.as_deref() == Some(path) {
+        if self
+            .deny
+            .as_ref()
+            .is_some_and(|d| d.file_name() == path.file_name())
+        {
             return Err(AppError::new(
                 ErrorCategory::PermissionDenied,
                 "move to the Trash",
@@ -106,12 +116,30 @@ impl Trasher for FakeTrash {
             ));
         }
         // Stand-in for the Trash: a sibling folder inside the owned fixture.
-        let holder = path.parent().unwrap().join(".fake-trash");
+        let mut base = path.parent().unwrap();
+        // A replacement hands over the item inside its private holding folder.
+        if base.to_string_lossy().ends_with(".old") {
+            base = base.parent().unwrap();
+        }
+        let holder = base.join(".fake-trash");
         fs::create_dir_all(&holder).unwrap();
         let to = holder.join(path.file_name().unwrap());
         fs::rename(path, &to).unwrap();
         self.trashed.lock().unwrap().push(path.to_path_buf());
         Ok(Some(to))
+    }
+}
+
+/// Runs a callback just before delegating to [`FakeTrash`], to simulate concurrent changes.
+struct HookTrash<F: Fn(&Path) + Sync> {
+    hook: F,
+    inner: FakeTrash,
+}
+
+impl<F: Fn(&Path) + Sync> Trasher for HookTrash<F> {
+    fn trash(&self, path: &Path) -> Result<Option<PathBuf>, AppError> {
+        (self.hook)(path);
+        self.inner.trash(path)
     }
 }
 
@@ -763,4 +791,236 @@ fn many_failures_are_capped_but_counted() {
     assert_eq!(summary.failed.len() as u64 + summary.failed_omitted, 600);
     assert!(summary.failed_omitted > 0);
     f.cleanup().unwrap();
+}
+
+#[test]
+fn move_replace_keeps_a_source_edited_after_it_was_copied() {
+    let f = fx("mfm-op-edit");
+    let src = dir(&f, "src");
+    let dst = dir(&f, "dst");
+    fs::write(src.join("a.txt"), "original").unwrap();
+    fs::write(dst.join("a.txt"), "old").unwrap();
+    let edited = src.join("a.txt");
+    let trash = HookTrash {
+        hook: |_: &Path| fs::write(&edited, "new edit not copied").unwrap(),
+        inner: FakeTrash::default(),
+    };
+    let ctl = Ctl::deciding(ConflictDecision::Replace, false);
+    run_transfer(
+        "t",
+        &ctl,
+        &trash,
+        TransferMode::Move,
+        vec![src.join("a.txt")],
+        &dst,
+    );
+    let (summary, _) = ctl.summary();
+    assert_eq!(read(&src.join("a.txt")), "new edit not copied");
+    assert_eq!(read(&dst.join("a.txt")), "original");
+    assert_eq!((summary.succeeded, summary.failed.len()), (0, 1));
+    assert!(
+        summary.failed[0]
+            .error
+            .message
+            .contains("changed after it was copied")
+    );
+    f.cleanup().unwrap();
+}
+
+#[test]
+fn move_replace_keeps_a_source_whose_path_was_replaced() {
+    let f = fx("mfm-op-swapped");
+    let src = dir(&f, "src");
+    let dst = dir(&f, "dst");
+    fs::write(src.join("a.txt"), "original").unwrap();
+    fs::write(dst.join("a.txt"), "old").unwrap();
+    let path = src.join("a.txt");
+    let trash = HookTrash {
+        hook: |_: &Path| {
+            fs::remove_file(&path).unwrap();
+            fs::write(&path, "original").unwrap();
+        },
+        inner: FakeTrash::default(),
+    };
+    let ctl = Ctl::deciding(ConflictDecision::Replace, false);
+    run_transfer(
+        "t",
+        &ctl,
+        &trash,
+        TransferMode::Move,
+        vec![src.join("a.txt")],
+        &dst,
+    );
+    let (summary, _) = ctl.summary();
+    assert!(src.join("a.txt").exists(), "a replacement is never deleted");
+    assert_eq!((summary.succeeded, summary.failed.len()), (0, 1));
+    f.cleanup().unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cross_volume_cleanup_keeps_changed_children_and_folders_behind_changed_paths() {
+    let f = fx("mfm-op-xcleanup");
+    let src = dir(&f, "src");
+    let dst = dir(&f, "dst");
+    let tree = src.join("tree");
+    fs::create_dir_all(tree.join("sub")).unwrap();
+    fs::write(tree.join("a.txt"), "a").unwrap();
+    fs::write(tree.join("sub/b.txt"), "b").unwrap();
+    let ctl = Ctl::silent();
+    let trash = FakeTrash::default();
+    let mut run = Run::new("t", &ctl, &trash, "move");
+    let mut copied: Option<Copied> = Some(Vec::new());
+    assert_eq!(
+        run.copy_node(&tree, &dst.join("tree"), true, &mut copied)
+            .unwrap(),
+        Node::Done
+    );
+    // After the copy: one child is edited, and the sub folder is swapped for another.
+    fs::write(tree.join("a.txt"), "a, edited").unwrap();
+    let moved_aside = src.join("sub-original");
+    fs::rename(tree.join("sub"), &moved_aside).unwrap();
+    fs::create_dir(tree.join("sub")).unwrap();
+    fs::write(tree.join("sub/b.txt"), "someone else's b").unwrap();
+    run.remove_copied_sources(copied.unwrap(), 0);
+    assert_eq!(read(&tree.join("a.txt")), "a, edited");
+    assert_eq!(read(&tree.join("sub/b.txt")), "someone else's b");
+    assert_eq!(read(&moved_aside.join("b.txt")), "b");
+    assert_eq!(run.succeeded, 0);
+    assert!(run.failure_count() >= 2);
+    f.cleanup().unwrap();
+}
+
+#[test]
+fn a_stale_replace_decision_never_trashes_a_directory_that_took_the_name() {
+    let f = fx("mfm-op-stale");
+    let src = dir(&f, "src");
+    let dst = dir(&f, "dst");
+    fs::write(src.join("a.txt"), "new").unwrap();
+    fs::write(dst.join("a.txt"), "old").unwrap();
+    let target = dst.join("a.txt");
+    let aside = f.path().join("old-a.txt");
+    let calls = AtomicUsize::new(0);
+    let ctl = Ctl::new(move |prompt| {
+        if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            assert_eq!(prompt.destination_kind, EntryKind::File);
+            fs::rename(&target, &aside).unwrap();
+            fs::create_dir(&target).unwrap();
+            fs::write(target.join("sentinel"), "keep me").unwrap();
+            Some(Resolution {
+                decision: ConflictDecision::Replace,
+                apply_to_all: true,
+            })
+        } else {
+            assert_eq!(prompt.destination_kind, EntryKind::Directory);
+            Some(Resolution {
+                decision: ConflictDecision::Skip,
+                apply_to_all: false,
+            })
+        }
+    });
+    let trash = FakeTrash::default();
+    run_transfer(
+        "t",
+        &ctl,
+        &trash,
+        TransferMode::Copy,
+        vec![src.join("a.txt")],
+        &dst,
+    );
+    let (summary, _) = ctl.summary();
+    assert_eq!(
+        ctl.prompts.lock().unwrap().len(),
+        2,
+        "consent was asked again"
+    );
+    assert_eq!(
+        (summary.succeeded, summary.skipped, summary.failed.len()),
+        (0, 1, 0)
+    );
+    assert_eq!(read(&dst.join("a.txt/sentinel")), "keep me");
+    assert!(trash.trashed.lock().unwrap().is_empty());
+    assert_eq!(read(&f.path().join("old-a.txt")), "old");
+    f.cleanup().unwrap();
+}
+
+#[test]
+fn replacement_consent_does_not_carry_over_to_a_different_file_at_the_name() {
+    let f = fx("mfm-op-stale2");
+    let src = dir(&f, "src");
+    let dst = dir(&f, "dst");
+    fs::write(src.join("a.txt"), "new").unwrap();
+    fs::write(dst.join("a.txt"), "old").unwrap();
+    let target = dst.join("a.txt");
+    let aside = f.path().join("old-a.txt");
+    let calls = AtomicUsize::new(0);
+    let ctl = Ctl::new(move |_| {
+        if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            fs::rename(&target, &aside).unwrap();
+            fs::write(&target, "someone else's file").unwrap();
+            Some(Resolution {
+                decision: ConflictDecision::Replace,
+                apply_to_all: true,
+            })
+        } else {
+            Some(Resolution {
+                decision: ConflictDecision::Skip,
+                apply_to_all: false,
+            })
+        }
+    });
+    let trash = FakeTrash::default();
+    run_transfer(
+        "t",
+        &ctl,
+        &trash,
+        TransferMode::Copy,
+        vec![src.join("a.txt")],
+        &dst,
+    );
+    let (summary, _) = ctl.summary();
+    assert_eq!(ctl.prompts.lock().unwrap().len(), 2);
+    assert_eq!(summary.skipped, 1);
+    assert_eq!(read(&dst.join("a.txt")), "someone else's file");
+    assert!(trash.trashed.lock().unwrap().is_empty());
+    let leftovers = fs::read_dir(&dst)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".mfm-replace"))
+        .count();
+    assert_eq!(leftovers, 0);
+    f.cleanup().unwrap();
+}
+
+#[test]
+fn cancelling_a_folder_copy_discloses_the_partly_copied_folder() {
+    let mut saw_child = false;
+    for countdown in 0..40 {
+        let f = fx("mfm-op-partial");
+        let src = dir(&f, "src");
+        let dst = dir(&f, "dst");
+        let tree = src.join("tree");
+        fs::create_dir(&tree).unwrap();
+        for n in ["a", "b", "c"] {
+            fs::write(tree.join(n), n).unwrap();
+        }
+        let ctl = Ctl::silent();
+        ctl.countdown.store(countdown, Ordering::Relaxed);
+        transfer(TransferMode::Copy, &ctl, vec![tree.clone()], &dst);
+        let (summary, cancelled) = ctl.summary();
+        let copy = dst.join("tree");
+        if cancelled && copy.exists() {
+            assert_eq!(summary.succeeded, 0, "the folder is not counted as done");
+            assert_eq!(summary.partial, vec![path_to_id(&copy)]);
+            saw_child |= fs::read_dir(&copy).unwrap().count() > 0;
+            assert!(tree.join("a").exists(), "the source is untouched");
+        } else if !cancelled {
+            assert!(summary.partial.is_empty());
+        }
+        f.cleanup().unwrap();
+    }
+    assert!(
+        saw_child,
+        "some run cancelled after a child had been copied"
+    );
 }

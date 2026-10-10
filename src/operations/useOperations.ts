@@ -41,7 +41,7 @@ export function useOperations({ onChanged }: Options) {
   known.current = new Map(operations.map((op) => [op.id, op]));
   const changed = useRef(onChanged);
   changed.current = onChanged;
-  const ready = useRef<Promise<unknown>>(Promise.resolve());
+  const ready = useRef<Promise<boolean>>(Promise.resolve(false));
   const meta = useRef(new Map<string, Operation>());
 
   useEffect(() => {
@@ -59,8 +59,12 @@ export function useOperations({ onChanged }: Options) {
       }
     });
     ready.current = subscription.then(
-      (fn) => (active ? (unlisten = fn) : fn()),
-      () => undefined,
+      (fn) => {
+        if (active) unlisten = fn;
+        else fn();
+        return true;
+      },
+      () => false,
     );
     return () => {
       active = false;
@@ -74,7 +78,17 @@ export function useOperations({ onChanged }: Options) {
     meta.current.set(id, op);
     dispatch({ type: "add", operation: op });
     // Subscribed before the command runs, so the first event cannot be missed.
-    void ready.current.then(() => request.run(id)).catch((reason) => {
+    void ready.current
+      .then((subscribed) => {
+        if (!subscribed) {
+          throw {
+            category: "io",
+            message: "Could not listen for operation progress, so the operation was not started. Nothing was changed.",
+          };
+        }
+        return request.run(id);
+      })
+      .catch((reason) => {
       meta.current.delete(id);
       dispatch({ type: "start-failed", id, error: toAppError(reason, request.title) });
     });
