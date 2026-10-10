@@ -1,3 +1,4 @@
+import { DROP_ATTRS } from "./dragdrop/useDragDrop";
 import FileIcon from "./FileIcon";
 import type { Place, Places } from "./backend/contracts";
 import type { AppError } from "./backend/contracts";
@@ -7,6 +8,7 @@ interface Props {
   places: Places | null;
   error: AppError | null;
   currentPath: string | null;
+  dropHighlight: { key: string; allowed: boolean } | null;
   onOpen(location: Location): void;
   onContextMenu(location: Location, x: number, y: number): void;
 }
@@ -20,11 +22,13 @@ function Section({ title, items, props }: { title: string; items: Place[]; props
         {items.map((place) => {
           const location = locationOf(place.entry);
           const current = props.currentPath === place.entry.path;
+          const hot = props.dropHighlight?.key === place.entry.id ? props.dropHighlight : null;
           return (
             <li key={place.entry.id}>
               <button
                 type="button"
-                className={`place${current ? " current" : ""}`}
+                className={`place${current ? " current" : ""}${hot ? (hot.allowed ? " drop-target" : " drop-refused") : ""}`}
+                {...{ [DROP_ATTRS.id]: place.entry.id, [DROP_ATTRS.name]: place.label }}
                 aria-current={current ? "page" : undefined}
                 title={place.entry.path}
                 onClick={() => props.onOpen(location)}

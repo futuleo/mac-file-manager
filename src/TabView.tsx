@@ -24,6 +24,8 @@ interface Props {
   onContextMenu(entry: FileEntry | null, x: number, y: number): void;
   onRename(): void;
   onQuickLook(): void;
+  onDragOut(entry: FileEntry): void;
+  dropHighlight: { key: string; allowed: boolean } | null;
   onRetry(): void;
   onBack(): void;
   onDismissAction(): void;
@@ -170,6 +172,8 @@ export default function TabView(props: Props) {
           onContextMenu={props.onContextMenu}
           onRename={props.onRename}
           onQuickLook={props.onQuickLook}
+          onDragOut={props.onDragOut}
+          dropHighlight={props.dropHighlight}
         />
       )}
     </div>

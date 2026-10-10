@@ -22,9 +22,10 @@ import {
   type ColumnWidths,
   type Preferences,
 } from "./explorer/preferences";
-import { emptySelection, invert, selectAll, type Selection } from "./explorer/selection";
+import { emptySelection, invert, selectAll, selectOnly, type Selection } from "./explorer/selection";
 import { formatSize, isHidden, nextSort, sortEntries, type SortKey, type SortState } from "./explorer/sort";
 import { startTitle, type Clipboard } from "./operations/model";
+import { useDragDrop } from "./dragdrop/useDragDrop";
 import { useOperations } from "./operations/useOperations";
 import { MAX_TABS, activeTab, initialTabsState, tabsReducer, type Tab } from "./explorer/tabs";
 
@@ -92,6 +93,58 @@ export default function App() {
   });
 
   useEffect(() => savePreferences(prefs), [prefs]);
+
+  const dragDrop = useDragDrop({
+    announce: setAnnouncement,
+    context: () => {
+      const t = activeTab(stateRef.current);
+      if (!t) return null;
+      const here = hist.current(t.history);
+      return {
+        tabId: t.id,
+        nav: t.nav,
+        view: `${t.viewSerial}`,
+        folderId: here && !t.search ? here.id : null,
+        folderName: here?.name || "/",
+      };
+    },
+    onDrop: ({ operation, count, tabId, targetName, run }) => {
+      const kind = operation === "move" ? "move" : "copy";
+      operations.start({
+        kind,
+        title: startTitle(kind, count, targetName || "/"),
+        itemCount: count,
+        originTabId: tabId,
+        run,
+      });
+    },
+    onProblem: (message, tabId) => {
+      setAnnouncement(message);
+      if (tabId) dispatch({ type: "action-error", tabId, error: { category: "invalidInput", operation: "drag and drop", context: null, message } });
+    },
+    onSourceEnded: (event) => {
+      const items = `${event.count} item${event.count === 1 ? "" : "s"}`;
+      if (event.outcome === "cancelled") setAnnouncement("Drag cancelled");
+      else if (event.outcome === "handedOffCopy") setAnnouncement(`${items} offered for copying; the receiving app does the copy`);
+      else if (event.outcome === "handedOffMove") {
+        setAnnouncement(`${items} offered for moving; the receiving app does the move`);
+        // The receiver may have moved them away: show what is on disk now.
+        reloadFolders(event.folders);
+      } else if (event.outcome === "unexpected") reloadFolders(event.folders);
+    },
+  });
+
+  const dragOut = (entry: FileEntry) => {
+    const t = activeTab(stateRef.current);
+    if (!t) return;
+    const ids = selectionRef.current.ids.has(entry.id) ? selectedEntries().map((e) => e.id) : [entry.id];
+    if (!selectionRef.current.ids.has(entry.id)) select(selectOnly(entry.id));
+    call("start_drag", { ids }).catch((reason) => {
+      const error = toAppError(reason, "drag");
+      setAnnouncement(error.message);
+      dispatch({ type: "action-error", tabId: t.id, error });
+    });
+  };
 
   const tab = activeTab(state);
   const location = tab ? hist.current(tab.history) : null;
@@ -649,6 +702,7 @@ export default function App() {
           places={places}
           error={placesError}
           currentPath={currentPath}
+          dropHighlight={dragDrop.highlight}
           onOpen={(target) => tab && navigate(tab.id, target)}
           onContextMenu={openSidebarMenu}
         />
@@ -681,7 +735,7 @@ export default function App() {
               role="tabpanel"
               id={tabPanelId(tab.id)}
               aria-labelledby={tabButtonId(tab.id)}
-              className="tabpanel"
+              className={`tabpanel${dragDrop.highlight?.key === "current" ? (dragDrop.highlight.allowed ? " drop-target" : " drop-refused") : ""}`}
             >
               {!location && homeError ? (
                 <div className="error-view" role="alert">
@@ -714,6 +768,8 @@ export default function App() {
                   onContextMenu={openItemMenu}
                   onRename={beginRename}
                   onQuickLook={togglePreview}
+                  onDragOut={dragOut}
+                  dropHighlight={dragDrop.highlight}
                   onRetry={() => dispatch({ type: "reload", tabId: tab.id })}
                   onBack={() => dispatch({ type: "back", tabId: tab.id })}
                   onDismissAction={() => dispatch({ type: "action-error", tabId: tab.id, error: null })}

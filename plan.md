@@ -4,7 +4,7 @@
 
 The user authorized configuring the full autonomous writer/reviewer/fix/merge cycle.
 The scaffold, read-only filesystem backend and Explorer UI shell are implemented.
-File operations (folder creation, copy, move, rename, Trash) and Spotlight search are implemented; preview and drag-and-drop remain unimplemented.
+File operations (folder creation, copy, move, rename, Trash) and Spotlight search are implemented; Quick Look preview is implemented; drag-and-drop is implemented; real Finder gestures were run by the writer and await independent review, cross-volume and keyboard/visual acceptance.
 Before implementing, reread this file, including any user edits.
 
 This repository file is the source of truth for the implementation plan.

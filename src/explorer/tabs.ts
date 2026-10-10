@@ -46,6 +46,8 @@ export interface Tab {
   search: TabSearch | null;
   /** Source of `TabSearch.key`; never reused within a tab. */
   searchSerial: number;
+  /** Counts every swap between folder list and search list that does not change `nav`; never reused. */
+  viewSerial: number;
 }
 
 export interface TabsState {
@@ -92,6 +94,7 @@ function newTab(serial: number, location: Location | null): Tab {
     actionError: null,
     search: null,
     searchSerial: 0,
+    viewSerial: 0,
   };
 }
 
@@ -213,6 +216,7 @@ export function tabsReducer(state: TabsState, action: TabAction): TabsState {
         return {
           ...tab,
           searchSerial: key,
+          viewSerial: tab.viewSerial + 1,
           selection: emptySelection,
           reveal: null,
           actionError: null,
@@ -230,7 +234,7 @@ export function tabsReducer(state: TabsState, action: TabAction): TabsState {
         };
       });
     case "search-clear":
-      return update(state, action.tabId, (tab) => (tab.search ? { ...tab, search: null, selection: emptySelection } : tab));
+      return update(state, action.tabId, (tab) => (tab.search ? { ...tab, search: null, selection: emptySelection, viewSerial: tab.viewSerial + 1 } : tab));
     case "search-results":
       return onSearch(state, action.tabId, action.key, (s, tab) => {
         if (s.status === "failed") return tab;
