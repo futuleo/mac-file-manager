@@ -26,6 +26,9 @@ opt-level = 3
 panic = "abort"
 strip = true
 
+[dependencies.libc]
+version = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"
 objc2-app-kit = "0.3.2"

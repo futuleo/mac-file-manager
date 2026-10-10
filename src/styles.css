@@ -159,3 +159,18 @@ ul, ol { list-style: none; margin: 0; padding: 0; }
 .capabilities { border-collapse: collapse; width: 100%; }
 .capabilities caption { text-align: left; color: var(--text-muted); padding-bottom: 4px; }
 .capabilities th, .capabilities td { text-align: left; padding: 2px 6px; border-bottom: 1px solid var(--border); }
+
+/* File operations */
+.operations { border-top: 1px solid var(--border); background: #f7f7f7; max-height: 30vh; overflow: auto; }
+.operation { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 4px 10px; border-bottom: 1px solid var(--border); }
+.operation.attention { background: var(--warning); }
+.operation-text { flex: 1 1 200px; user-select: text; }
+.operation progress { width: 160px; }
+.operation ul { flex-basis: 100%; margin: 0; padding-left: 24px; list-style: disc; user-select: text; }
+.dialog-scrim { position: fixed; inset: 0; z-index: 200; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.25); }
+.dialog { min-width: 320px; max-width: 520px; padding: 12px 16px; background: #f2f2f2; border: 1px solid #a0a0a0; box-shadow: 2px 2px 6px rgba(0, 0, 0, 0.4); }
+.dialog h2 { margin: 0 0 8px; font-size: 1.1em; }
+.dialog input[type="text"] { width: 100%; box-sizing: border-box; }
+.dialog-note { color: var(--text-muted); }
+.dialog-error { color: var(--danger); }
+.dialog-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; justify-content: flex-end; }

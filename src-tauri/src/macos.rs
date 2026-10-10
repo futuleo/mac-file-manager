@@ -1,7 +1,11 @@
 //! Native macOS bridge. Uses `objc2` bindings to AppKit/Foundation/QuickLookUI;
 //! see README "Native API findings" for why and for the verified behavior.
 
-use std::{ffi::CString, os::unix::ffi::OsStrExt, path::Path};
+use std::{
+    ffi::CString,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+};
 
 use objc2::{
     ClassType,
@@ -9,10 +13,10 @@ use objc2::{
     runtime::AnyClass,
 };
 use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImageRep, NSWorkspace};
-use objc2_foundation::{NSDictionary, NSProcessInfo, NSString, NSURL};
+use objc2_foundation::{NSDictionary, NSFileManager, NSProcessInfo, NSString, NSURL};
 use objc2_quick_look_ui::QLPreviewPanel;
 
-use crate::contracts::NativeCapabilities;
+use crate::contracts::{AppError, ErrorCategory, NativeCapabilities, display_name};
 
 /// macOS version as `major.minor.patch`.
 pub fn os_version() -> String {
@@ -38,12 +42,20 @@ pub fn capabilities() -> NativeCapabilities {
 
 /// File URL built from the raw path bytes, so non-UTF-8 names stay addressable.
 fn file_url(path: &Path) -> Option<Retained<NSURL>> {
+    file_url_with(path, false)
+}
+
+fn file_url_with(path: &Path, is_directory: bool) -> Option<Retained<NSURL>> {
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
     let ptr = std::ptr::NonNull::new(c_path.as_ptr() as *mut _)?;
     // SAFETY: `ptr` is a valid NUL-terminated string that outlives the call;
     // the method copies it.
     Some(unsafe {
-        NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(ptr, false, None)
+        NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(
+            ptr,
+            is_directory,
+            None,
+        )
     })
 }
 
@@ -61,6 +73,72 @@ pub fn default_application(path: &Path) -> Option<String> {
 pub fn open_with_default_app(path: &Path) -> Option<bool> {
     let url = file_url(path)?;
     Some(NSWorkspace::sharedWorkspace().openURL(&url))
+}
+
+/// Moves `path` to the user's Trash through `NSFileManager`, which keeps the item
+/// restorable (never a permanent delete). Returns where it ended up in the Trash.
+pub fn trash_item(path: &Path) -> Result<Option<PathBuf>, AppError> {
+    let operation = "move to the Trash";
+    let is_dir = std::fs::symlink_metadata(path)
+        .map_err(|e| AppError::from_io(operation, path, &e))?
+        .is_dir();
+    let name = display_name(path);
+    let url = file_url_with(path, is_dir).ok_or_else(|| {
+        AppError::new(
+            ErrorCategory::InvalidInput,
+            operation,
+            Some(name.clone()),
+            format!("\"{name}\" has a path that cannot be moved to the Trash."),
+        )
+    })?;
+    autoreleasepool(|_| {
+        let mut resulting: Option<Retained<NSURL>> = None;
+        match NSFileManager::defaultManager()
+            .trashItemAtURL_resultingItemURL_error(&url, Some(&mut resulting))
+        {
+            Ok(()) => Ok(resulting
+                .and_then(|u| u.path())
+                .map(|p| PathBuf::from(p.to_string()))),
+            Err(error) => {
+                // NSFileNoSuchFileError = 4, NSFileWriteNoPermissionError = 513.
+                let category = match error.code() {
+                    4 => ErrorCategory::NotFound,
+                    513 => ErrorCategory::PermissionDenied,
+                    _ => ErrorCategory::Io,
+                };
+                Err(AppError::new(
+                    category,
+                    operation,
+                    Some(name.clone()),
+                    format!(
+                        "Could not move \"{name}\" to the Trash: {}",
+                        error.localizedDescription()
+                    ),
+                ))
+            }
+        }
+    })
+}
+
+/// Sends a standard editing action to the first responder, exactly as the
+/// native Edit menu does, so text fields keep native copy/cut/paste/select-all.
+/// Must run on the main thread.
+pub fn send_edit_action(action: &str) -> bool {
+    use objc2::{MainThreadMarker, sel};
+    use objc2_app_kit::NSApplication;
+    let selector = match action {
+        "copy" => sel!(copy:),
+        "cut" => sel!(cut:),
+        "paste" => sel!(paste:),
+        "selectAll" => sel!(selectAll:),
+        _ => return false,
+    };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    // SAFETY: the selectors are the standard NSResponder editing actions and no
+    // sender or target is passed.
+    unsafe { NSApplication::sharedApplication(mtm).sendAction_to_from(selector, None, None) }
 }
 
 /// PNG of the system icon for `path`, using the representation closest to
@@ -157,6 +235,30 @@ mod tests {
         // File URLs from raw bytes: invalid UTF-8 and NUL.
         assert!(file_url(Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff"))).is_some());
         assert!(file_url(Path::new(std::ffi::OsStr::from_bytes(b"/tmp/a\0b"))).is_none());
+        fx.cleanup().unwrap();
+    }
+
+    #[test]
+    fn trashing_moves_an_owned_fixture_to_the_trash_and_is_restorable() {
+        let fx = Fixture::create_in(&std::env::temp_dir(), "mfm-trash-test").unwrap();
+        let file = fx.write("victim.txt", "payload").unwrap();
+        let dir = fx.path().join("folder");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("inner.txt"), "inner").unwrap();
+        let file_result = trash_item(&file).unwrap().expect("resulting location");
+        let dir_result = trash_item(&dir).unwrap().expect("resulting location");
+        assert!(!file.exists() && !dir.exists());
+        // The item is in the Trash (recoverable), not deleted.
+        assert_eq!(std::fs::read_to_string(&file_result).unwrap(), "payload");
+        assert_eq!(
+            std::fs::read_to_string(dir_result.join("inner.txt")).unwrap(),
+            "inner"
+        );
+        // Only the items this test trashed are removed from the Trash again.
+        std::fs::remove_file(&file_result).unwrap();
+        std::fs::remove_dir_all(&dir_result).unwrap();
+        let missing = trash_item(&fx.path().join("missing")).unwrap_err();
+        assert_eq!(missing.category, ErrorCategory::NotFound);
         fx.cleanup().unwrap();
     }
 

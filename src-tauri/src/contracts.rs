@@ -137,6 +137,30 @@ pub struct ItemFailure {
     pub error: AppError,
 }
 
+/// What `completed`/`total` of a progress event count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProgressUnit {
+    Items,
+    Bytes,
+}
+
+/// Outcome counters shared by the terminal events of a file operation.
+/// `succeeded` and `skipped` count the requested top-level items that were
+/// completed without any failure, or were skipped by a conflict decision;
+/// `failed` lists failed items at any depth (capped, with `failed_omitted`
+/// counting the rest). `affected` lists the lossless ids of folders whose
+/// contents changed or may have changed, so views of them can be refreshed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSummary {
+    pub succeeded: u64,
+    pub skipped: u64,
+    pub failed: Vec<ItemFailure>,
+    pub failed_omitted: u64,
+    pub affected: Vec<String>,
+}
+
 /// Progress for long operations. `completed`/`total` are `None` when the amount
 /// of work is not measurable; consumers must not invent percentages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,24 +172,39 @@ pub enum TaskEvent {
         stage: TaskStage,
         completed: Option<u64>,
         total: Option<u64>,
+        unit: ProgressUnit,
     },
     /// The task is paused until `resolve_conflict` is called with `conflict_id`.
+    /// `same_item` means the destination is the source itself (copy into its own
+    /// folder). Replacing is only possible when neither side is a folder and the
+    /// items are not the same.
     #[serde(rename_all = "camelCase")]
     Conflict {
         task_id: TaskId,
         conflict_id: String,
         source_id: String,
         destination_id: String,
+        source_name: String,
+        destination_name: String,
+        source_kind: EntryKind,
+        destination_kind: EntryKind,
+        same_item: bool,
     },
     /// Completion with partial failures is reported, not hidden.
     #[serde(rename_all = "camelCase")]
     Finished {
         task_id: TaskId,
-        succeeded: u64,
-        failed: Vec<ItemFailure>,
+        #[serde(flatten)]
+        summary: TaskSummary,
     },
+    /// Cancellation stops further work; completed work is not rolled back.
     #[serde(rename_all = "camelCase")]
-    Cancelled { task_id: TaskId, succeeded: u64 },
+    Cancelled {
+        task_id: TaskId,
+        #[serde(flatten)]
+        summary: TaskSummary,
+    },
+    /// The task could not start or run at all; nothing was reported as done.
     #[serde(rename_all = "camelCase")]
     Failed { task_id: TaskId, error: AppError },
 }
@@ -340,20 +379,27 @@ mod tests {
     fn events_are_tagged_and_round_trip() {
         let event = TaskEvent::Finished {
             task_id: "t1".into(),
-            succeeded: 2,
-            failed: vec![ItemFailure {
-                id: "61".into(),
-                error: AppError {
-                    category: ErrorCategory::PermissionDenied,
-                    operation: "copy".into(),
-                    context: Some("a".into()),
-                    message: "Permission denied".into(),
-                },
-            }],
+            summary: TaskSummary {
+                succeeded: 2,
+                skipped: 1,
+                failed: vec![ItemFailure {
+                    id: "61".into(),
+                    error: AppError {
+                        category: ErrorCategory::PermissionDenied,
+                        operation: "copy".into(),
+                        context: Some("a".into()),
+                        message: "Permission denied".into(),
+                    },
+                }],
+                failed_omitted: 0,
+                affected: vec!["2f".into()],
+            },
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "finished");
         assert_eq!(value["taskId"], "t1");
+        assert_eq!(value["succeeded"], 2);
+        assert_eq!(value["affected"][0], "2f");
         assert_eq!(value["failed"][0]["error"]["category"], "permissionDenied");
         assert_eq!(serde_json::from_value::<TaskEvent>(value).unwrap(), event);
 

@@ -3,8 +3,10 @@ pub mod filesystem;
 #[cfg(target_os = "macos")]
 mod macos;
 mod menu;
+pub mod operations;
 /// Owned scratch directories for the `examples/` spikes and unit tests.
 pub mod spike_fixture;
+pub mod tasks;
 
 use std::{
     collections::HashMap,
@@ -19,9 +21,11 @@ use base64::Engine;
 use tauri::{Emitter, Runtime, State, WebviewWindow};
 
 use contracts::{
-    AppError, DIRECTORY_EVENT, ErrorCategory, FileEntry, NativeCapabilities, PlatformInfo,
-    display_name,
+    AppError, ConflictDecision, DIRECTORY_EVENT, ErrorCategory, FileEntry, NativeCapabilities,
+    PlatformInfo, TASK_EVENT, TaskEvent, display_name,
 };
+use operations::{SystemTrash, TransferMode};
+use tasks::{HostControl, TaskGuard, Tasks};
 
 /// Configured deployment target, not a tested support claim. Keep in sync with
 /// `bundle.macOS.minimumSystemVersion` in tauri.conf.json.
@@ -291,10 +295,145 @@ async fn get_icon(id: String, size: u32) -> Result<String, AppError> {
     .map_err(|_| join_error("load the icon"))?
 }
 
+fn ids_to_paths(operation: &str, ids: &[String]) -> Result<Vec<std::path::PathBuf>, AppError> {
+    if ids.is_empty() || ids.len() > MAX_TASK_ITEMS {
+        return Err(AppError::new(
+            ErrorCategory::InvalidInput,
+            operation,
+            None,
+            format!("Choose between 1 and {MAX_TASK_ITEMS} items."),
+        ));
+    }
+    ids.iter()
+        .map(|id| filesystem::resolve_id(operation, id))
+        .collect()
+}
+
+const MAX_TASK_ITEMS: usize = 100_000;
+
+/// Runs `work` off the UI thread as a registered, cancellable task whose events
+/// go to the calling window only.
+fn spawn_task<R: Runtime>(
+    window: WebviewWindow<R>,
+    tasks: &Arc<Tasks>,
+    task_id: String,
+    work: impl FnOnce(&str, &HostControl<'_>) + Send + 'static,
+) -> Result<(), AppError> {
+    let task = tasks.register(&task_id)?;
+    let tasks = Arc::clone(tasks);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = TaskGuard(&tasks, task_id.clone());
+        let label = window.label().to_string();
+        let sink = |event: TaskEvent| {
+            let _ = window.emit_to(label.as_str(), TASK_EVENT, event);
+        };
+        let control = HostControl {
+            task_id: &task_id,
+            task: &task,
+            sink: &sink,
+        };
+        work(&task_id, &control);
+    });
+    Ok(())
+}
+
+/// Copies (`move_items` false) or moves items into a folder. Progress, conflicts
+/// and the result arrive on `TASK_EVENT` tagged with `task_id`.
+#[tauri::command]
+fn start_transfer<R: Runtime>(
+    window: WebviewWindow<R>,
+    tasks: State<'_, Arc<Tasks>>,
+    task_id: String,
+    move_items: bool,
+    source_ids: Vec<String>,
+    destination_id: String,
+) -> Result<(), AppError> {
+    let mode = if move_items {
+        TransferMode::Move
+    } else {
+        TransferMode::Copy
+    };
+    let operation = if move_items { "move" } else { "copy" };
+    let sources = ids_to_paths(operation, &source_ids)?;
+    let destination = filesystem::resolve_id(operation, &destination_id)?;
+    spawn_task(window, &tasks, task_id, move |id, control| {
+        operations::run_transfer(id, control, &SystemTrash, mode, sources, &destination);
+    })
+}
+
+/// Moves items to the macOS Trash (recoverable). Never deletes permanently.
+#[tauri::command]
+fn trash_items<R: Runtime>(
+    window: WebviewWindow<R>,
+    tasks: State<'_, Arc<Tasks>>,
+    task_id: String,
+    ids: Vec<String>,
+) -> Result<(), AppError> {
+    let paths = ids_to_paths("move to the Trash", &ids)?;
+    spawn_task(window, &tasks, task_id, move |id, control| {
+        operations::run_trash(id, control, &SystemTrash, paths);
+    })
+}
+
+#[tauri::command]
+fn resolve_conflict(
+    tasks: State<'_, Arc<Tasks>>,
+    conflict_id: String,
+    decision: ConflictDecision,
+    apply_to_all: bool,
+) -> Result<(), AppError> {
+    tasks.resolve(&conflict_id, decision, apply_to_all)
+}
+
+/// Applies a standard editing action (copy, cut, paste, selectAll) to the focused
+/// text field, as the native Edit menu would.
+#[tauri::command]
+fn edit_action<R: Runtime>(app: tauri::AppHandle<R>, action: String) -> Result<(), AppError> {
+    #[cfg(target_os = "macos")]
+    app.run_on_main_thread(move || {
+        macos::send_edit_action(&action);
+    })
+    .map_err(|_| join_error("edit"))?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, action);
+    Ok(())
+}
+
+/// Idempotent: cancelling a finished or unknown task is not an error.
+#[tauri::command]
+fn cancel_task(tasks: State<'_, Arc<Tasks>>, task_id: String) {
+    tasks.cancel(&task_id);
+}
+
+#[tauri::command]
+async fn create_folder(parent_id: String, name: Option<String>) -> Result<FileEntry, AppError> {
+    let operation = "create the folder";
+    let parent = filesystem::resolve_id(operation, &parent_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = operations::create_folder(&parent, name.as_deref())?;
+        filesystem::entry_for_path(&path).map_err(|e| AppError::from_io(operation, &path, &e))
+    })
+    .await
+    .map_err(|_| join_error(operation))?
+}
+
+#[tauri::command]
+async fn rename_item(id: String, new_name: String) -> Result<FileEntry, AppError> {
+    let operation = "rename";
+    let path = filesystem::resolve_id(operation, &id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let renamed = operations::rename_item(&path, &new_name)?;
+        filesystem::entry_for_path(&renamed).map_err(|e| AppError::from_io(operation, &renamed, &e))
+    })
+    .await
+    .map_err(|_| join_error(operation))?
+}
+
 /// State and command registration, shared by the app and the mock-runtime tests.
 fn register<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
         .manage(Arc::new(DirectoryReads::default()))
+        .manage(Arc::new(Tasks::default()))
         .invoke_handler(tauri::generate_handler![
             get_platform_info,
             get_home_directory,
@@ -304,7 +443,14 @@ fn register<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             start_directory_read,
             cancel_directory_read,
             open_item,
-            get_icon
+            get_icon,
+            start_transfer,
+            trash_items,
+            resolve_conflict,
+            cancel_task,
+            edit_action,
+            create_folder,
+            rename_item
         ])
 }
 
@@ -616,6 +762,162 @@ mod tests {
                     .map(Vec::len)
                     .sum();
                 assert!(delivered < 20_000);
+            }
+            fx.cleanup().unwrap();
+        }
+
+        fn task_events(window: &WebviewWindow<MockRuntime>) -> Arc<Mutex<Vec<Value>>> {
+            let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let sink = events.clone();
+            window.listen(crate::contracts::TASK_EVENT, move |e| {
+                sink.lock()
+                    .unwrap()
+                    .push(serde_json::from_str(e.payload()).unwrap());
+            });
+            events
+        }
+
+        fn terminal(e: &Value) -> bool {
+            matches!(
+                e["type"].as_str(),
+                Some("finished" | "cancelled" | "failed")
+            )
+        }
+
+        #[test]
+        fn file_operation_commands_run_through_real_wiring_with_events_and_conflicts() {
+            let (app, window) = app();
+            let events = task_events(&window);
+            let fx = Fixture::create_in(&std::env::temp_dir(), "mfm-ipc-ops").unwrap();
+            let src = fx.write("a.txt", "from-source").unwrap();
+            let dst = fx.path().join("dst");
+            std::fs::create_dir(&dst).unwrap();
+            std::fs::write(dst.join("a.txt"), "already-here").unwrap();
+
+            // create_folder / rename_item return fresh entries.
+            let made = invoke(
+                &window,
+                "create_folder",
+                json!({"parentId": path_to_id(fx.path()), "name": null}),
+            )
+            .unwrap();
+            assert_eq!(made["name"], "New folder");
+            let renamed = invoke(
+                &window,
+                "rename_item",
+                json!({"id": made["id"], "newName": "Renamed"}),
+            )
+            .unwrap();
+            assert_eq!(renamed["name"], "Renamed");
+            assert_eq!(
+                invoke(
+                    &window,
+                    "rename_item",
+                    json!({"id": renamed["id"], "newName": "a/b"})
+                )
+                .unwrap_err()["category"],
+                "invalidInput"
+            );
+
+            // A conflicting copy pauses until the frontend answers.
+            invoke(
+                &window,
+                "start_transfer",
+                json!({"taskId": "k1", "moveItems": false,
+                       "sourceIds": [path_to_id(&src)], "destinationId": path_to_id(&dst)}),
+            )
+            .unwrap();
+            let seen = wait_for(&events, |e| e.iter().any(|x| x["type"] == "conflict"));
+            let conflict = seen.iter().find(|x| x["type"] == "conflict").unwrap();
+            assert_eq!(conflict["taskId"], "k1");
+            assert_eq!(conflict["destinationName"], "a.txt");
+            assert_eq!(conflict["sameItem"], false);
+            assert_eq!(
+                std::fs::read_to_string(dst.join("a.txt")).unwrap(),
+                "already-here"
+            );
+            invoke(
+                &window,
+                "resolve_conflict",
+                json!({"conflictId": conflict["conflictId"], "decision": "keepBoth", "applyToAll": false}),
+            )
+            .unwrap();
+            let seen = wait_for(&events, |e| e.iter().any(terminal));
+            let end = seen.last().unwrap();
+            assert_eq!(end["type"], "finished");
+            assert_eq!(end["succeeded"], 1);
+            assert_eq!(
+                std::fs::read_to_string(dst.join("a copy.txt")).unwrap(),
+                "from-source"
+            );
+            assert!(
+                end["affected"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(path_to_id(&dst)))
+            );
+            assert!(
+                invoke(
+                    &window,
+                    "resolve_conflict",
+                    json!({"conflictId": "k1-c1", "decision": "skip", "applyToAll": false})
+                )
+                .is_err()
+            );
+
+            // Cancel a task that is waiting on a conflict.
+            wait_for(&events, |_| app.state::<Arc<crate::Tasks>>().is_empty());
+            events.lock().unwrap().clear();
+            invoke(
+                &window,
+                "start_transfer",
+                json!({"taskId": "k2", "moveItems": true,
+                       "sourceIds": [path_to_id(&dst.join("a copy.txt"))],
+                       "destinationId": path_to_id(&dst)}),
+            )
+            .unwrap();
+            wait_for(&events, |e| e.iter().any(terminal));
+            // Moving onto itself is reported per item and the file survives.
+            assert_eq!(
+                events.lock().unwrap().last().unwrap()["failed"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(dst.join("a copy.txt").exists());
+
+            events.lock().unwrap().clear();
+            wait_for(&events, |_| app.state::<Arc<crate::Tasks>>().is_empty());
+            invoke(
+                &window,
+                "start_transfer",
+                json!({"taskId": "k3", "moveItems": false,
+                       "sourceIds": [path_to_id(&src)], "destinationId": path_to_id(&dst)}),
+            )
+            .unwrap();
+            wait_for(&events, |e| e.iter().any(|x| x["type"] == "conflict"));
+            invoke(&window, "cancel_task", json!({"taskId": "k3"})).unwrap();
+            let seen = wait_for(&events, |e| e.iter().any(terminal));
+            assert_eq!(seen.last().unwrap()["type"], "cancelled");
+            invoke(&window, "cancel_task", json!({"taskId": "k3"})).unwrap();
+
+            // Validation: empty selections and bad ids are typed rejections.
+            for (cmd, body) in [
+                (
+                    "start_transfer",
+                    json!({"taskId": "x", "moveItems": false, "sourceIds": [], "destinationId": path_to_id(&dst)}),
+                ),
+                (
+                    "start_transfer",
+                    json!({"taskId": "x", "moveItems": false, "sourceIds": ["zz"], "destinationId": path_to_id(&dst)}),
+                ),
+                ("trash_items", json!({"taskId": "x", "ids": []})),
+            ] {
+                assert_eq!(
+                    invoke(&window, cmd, body).unwrap_err()["category"],
+                    "invalidInput"
+                );
             }
             fx.cleanup().unwrap();
         }

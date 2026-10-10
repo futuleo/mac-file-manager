@@ -4,7 +4,9 @@ import { call } from "./backend/client";
 import { MENU_EVENT, type AppError, type FileEntry, type Places } from "./backend/contracts";
 import { toAppError } from "./backend/directory";
 import ContextMenu, { type MenuItem } from "./ContextMenu";
+import NameDialog from "./NameDialog";
 import NavBar from "./NavBar";
+import OperationsPanel from "./OperationsPanel";
 import Ribbon from "./Ribbon";
 import Sidebar from "./Sidebar";
 import StatusBar from "./StatusBar";
@@ -21,6 +23,8 @@ import {
 } from "./explorer/preferences";
 import { emptySelection, invert, selectAll, type Selection } from "./explorer/selection";
 import { formatSize, isHidden, nextSort, sortEntries, type SortKey, type SortState } from "./explorer/sort";
+import { startTitle, type Clipboard } from "./operations/model";
+import { useOperations } from "./operations/useOperations";
 import { MAX_TABS, activeTab, initialTabsState, tabsReducer, type Tab } from "./explorer/tabs";
 
 interface MenuState {
@@ -28,6 +32,15 @@ interface MenuState {
   y: number;
   label: string;
   items: MenuItem[];
+}
+
+interface NameState {
+  mode: "rename" | "new";
+  entry: FileEntry;
+  tabId: string;
+  folderId: string;
+  error: string | null;
+  busy: boolean;
 }
 
 const SHORT = (name: string) => (name.length > 24 ? `${name.slice(0, 23)}…` : name);
@@ -47,6 +60,20 @@ export default function App() {
   stateRef.current = state;
   const selectionRef = useRef<Selection>(emptySelection);
   const rowsRef = useRef<FileEntry[]>([]);
+  const [clipboard, setClipboard] = useState<Clipboard | null>(null);
+  const [nameState, setNameState] = useState<NameState | null>(null);
+
+  // Reload only the tabs showing a changed folder; `reveal` selects an item in one tab.
+  const reloadFolders = useCallback((folderIds: string[], reveal?: { tabId: string; id: string }) => {
+    const changed = new Set(folderIds);
+    for (const t of stateRef.current.tabs) {
+      const here = hist.current(t.history);
+      if (here && changed.has(here.id)) {
+        dispatch({ type: "reload", tabId: t.id, reveal: reveal && reveal.tabId === t.id ? reveal.id : null });
+      }
+    }
+  }, []);
+  const operations = useOperations({ onChanged: (affected) => reloadFolders(affected) });
 
   useEffect(() => savePreferences(prefs), [prefs]);
 
@@ -224,6 +251,84 @@ export default function App() {
   rowsRef.current = rows;
   const selectAllRows = () => activeId && dispatch({ type: "select", tabId: activeId, selection: selectAll(rows, selection) });
 
+  const selectedEntries = () => rowsRef.current.filter((e) => selectionRef.current.ids.has(e.id));
+
+  const copySelection = (mode: Clipboard["mode"]) => {
+    const ids = selectedEntries().map((e) => e.id);
+    if (ids.length === 0) return;
+    setClipboard({ mode, ids });
+    setAnnouncement(`${ids.length} item${ids.length === 1 ? "" : "s"} ${mode === "copy" ? "copied" : "cut"}`);
+  };
+
+  const pasteHere = () => {
+    const t = activeTab(stateRef.current);
+    const here = t && hist.current(t.history);
+    if (!t || !here || !clipboard || clipboard.ids.length === 0) return;
+    const { mode, ids } = clipboard;
+    operations.start({
+      kind: mode === "cut" ? "move" : "copy",
+      title: startTitle(mode === "cut" ? "move" : "copy", ids.length, here.name || "/"),
+      itemCount: ids.length,
+      originTabId: t.id,
+      run: (taskId) => call("start_transfer", { taskId, moveItems: mode === "cut", sourceIds: ids, destinationId: here.id }),
+    });
+    if (mode === "cut") setClipboard(null);
+  };
+
+  const trashSelection = () => {
+    const t = activeTab(stateRef.current);
+    const ids = selectedEntries().map((e) => e.id);
+    if (!t || ids.length === 0) return;
+    operations.start({
+      kind: "trash",
+      title: startTitle("trash", ids.length),
+      itemCount: ids.length,
+      originTabId: t.id,
+      run: (taskId) => call("trash_items", { taskId, ids }),
+    });
+  };
+
+  const beginRename = () => {
+    const t = activeTab(stateRef.current);
+    const here = t && hist.current(t.history);
+    const entries = selectedEntries();
+    if (!t || !here || entries.length !== 1) return;
+    setNameState({ mode: "rename", entry: entries[0]!, tabId: t.id, folderId: here.id, error: null, busy: false });
+  };
+
+  const newFolder = () => {
+    const t = activeTab(stateRef.current);
+    const here = t && hist.current(t.history);
+    if (!t || !here) return;
+    call("create_folder", { parentId: here.id, name: null }).then(
+      (entry) => {
+        reloadFolders([here.id], { tabId: t.id, id: entry.id });
+        setNameState({ mode: "new", entry, tabId: t.id, folderId: here.id, error: null, busy: false });
+      },
+      (reason) => dispatch({ type: "action-error", tabId: t.id, error: toAppError(reason, "create the folder") }),
+    );
+  };
+
+  const submitName = (name: string) => {
+    const current = nameState;
+    if (!current) return;
+    if (name === current.entry.name) {
+      setNameState(null);
+      return;
+    }
+    setNameState({ ...current, busy: true, error: null });
+    call("rename_item", { id: current.entry.id, newName: name }).then(
+      (entry) => {
+        setNameState(null);
+        reloadFolders([current.folderId], { tabId: current.tabId, id: entry.id });
+      },
+      (reason) => setNameState({ ...current, busy: false, error: toAppError(reason, "rename the item").message }),
+    );
+  };
+
+  // Cancelling the name of a new folder keeps its default name.
+  const cancelName = () => setNameState(null);
+
   // Native menu actions arrive as ids on the menu event.
   const menuHandler = useRef<(id: string) => void>(() => {});
   menuHandler.current = (id) => {
@@ -231,10 +336,16 @@ export default function App() {
     // Native menu shortcuts must not hijack text editing.
     const el = document.activeElement as HTMLElement | null;
     const editing = !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+    if (editing && (id === "copy" || id === "cut" || id === "paste")) {
+      call("edit_action", { action: id }).catch(() => undefined);
+      return;
+    }
     if (editing && (id === "select-all" || id === "open")) {
       if (id === "select-all") (el as HTMLInputElement).select?.();
       return;
     }
+    if (editing && (id === "trash" || id === "rename" || id === "new-folder")) return;
+    if (nameState || operations.operations.some((op) => op.conflict)) return;
     switch (id) {
       case "new-tab": return newTab();
       case "close-tab": return t && closeTab(t.id);
@@ -248,6 +359,12 @@ export default function App() {
       case "enclosing-folder": return goUp();
       case "home": return t && home && navigate(t.id, home);
       case "address": return setAddressFocus((n) => n + 1);
+      case "new-folder": return newFolder();
+      case "copy": return copySelection("copy");
+      case "cut": return copySelection("cut");
+      case "paste": return pasteHere();
+      case "rename": return beginRename();
+      case "trash": return trashSelection();
       case "hidden-items": return setShowHidden(!prefs.showHidden);
     }
   };
@@ -296,11 +413,11 @@ export default function App() {
       }
       items.push(
         { separator: true },
-        { label: "Cut", unavailable: true },
-        { label: "Copy", unavailable: true },
+        { label: "Cut", shortcut: "⌘X", onSelect: () => copySelection("cut") },
+        { label: "Copy", shortcut: "⌘C", onSelect: () => copySelection("copy") },
         { separator: true },
-        { label: "Rename", unavailable: true },
-        { label: "Delete", unavailable: true },
+        { label: "Rename", shortcut: "F2", unavailable: selection.ids.size > 1, onSelect: beginRename },
+        { label: "Move to the Trash", shortcut: "⌘⌫", onSelect: trashSelection },
         { separator: true },
         { label: "Properties", unavailable: true },
       );
@@ -317,8 +434,8 @@ export default function App() {
           { separator: true },
           { label: "Hidden items", shortcut: "⇧⌘.", checked: prefs.showHidden, onSelect: () => setShowHidden(!prefs.showHidden) },
           { separator: true },
-          { label: "Paste", unavailable: true },
-          { label: "New folder", unavailable: true },
+          { label: "Paste", shortcut: "⌘V", unavailable: !clipboard, onSelect: pasteHere },
+          { label: "New folder", shortcut: "⇧⌘N", unavailable: !location, onSelect: newFolder },
         ],
       });
     }
@@ -371,6 +488,15 @@ export default function App() {
         hasSelection={selection.ids.size > 0}
         showHidden={prefs.showHidden}
         sort={prefs.sort}
+        canPaste={!!clipboard && !!location}
+        canCreate={!!location}
+        canRename={selection.ids.size === 1}
+        onCopy={() => copySelection("copy")}
+        onCut={() => copySelection("cut")}
+        onPaste={pasteHere}
+        onTrash={trashSelection}
+        onRename={beginRename}
+        onNewFolder={newFolder}
         onOpen={openFocused}
         onSelectAll={selectAllRows}
         onSelectNone={() => select(emptySelection)}
@@ -450,6 +576,7 @@ export default function App() {
                   onSelect={select}
                   onActivate={(entry) => openEntry(tab.id, entry)}
                   onContextMenu={openItemMenu}
+                  onRename={beginRename}
                   onRetry={() => dispatch({ type: "reload", tabId: tab.id })}
                   onBack={() => dispatch({ type: "back", tabId: tab.id })}
                   onDismissAction={() => dispatch({ type: "action-error", tabId: tab.id, error: null })}
@@ -459,6 +586,12 @@ export default function App() {
           )}
         </main>
       </div>
+      <OperationsPanel
+        operations={operations.operations}
+        onCancel={operations.cancel}
+        onResolve={operations.resolve}
+        onDismiss={operations.dismiss}
+      />
       <StatusBar
         total={rows.length}
         hidden={prefs.showHidden ? 0 : hiddenCount}
@@ -470,6 +603,17 @@ export default function App() {
       <div className="visually-hidden" role="status" aria-live="polite">
         {announcement}
       </div>
+      {nameState && (
+        <NameDialog
+          title={nameState.mode === "new" ? "Name the new folder" : "Rename"}
+          initial={nameState.entry.name}
+          confirmLabel={nameState.mode === "new" ? "Name folder" : "Rename"}
+          error={nameState.error}
+          busy={nameState.busy}
+          onSubmit={submitName}
+          onCancel={cancelName}
+        />
+      )}
       {menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
     </div>
   );

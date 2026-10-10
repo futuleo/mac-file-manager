@@ -7,6 +7,15 @@ interface Props {
   hasSelection: boolean;
   showHidden: boolean;
   sort: SortState;
+  canPaste: boolean;
+  canCreate: boolean;
+  canRename: boolean;
+  onCopy(): void;
+  onCut(): void;
+  onPaste(): void;
+  onTrash(): void;
+  onRename(): void;
+  onNewFolder(): void;
   onOpen(): void;
   onSelectAll(): void;
   onSelectNone(): void;
@@ -17,13 +26,13 @@ interface Props {
 
 const UNAVAILABLE = "Not available yet";
 
-function Command({ label, onClick, disabled, unavailable }: { label: string; onClick?: () => void; disabled?: boolean; unavailable?: boolean }) {
+function Command({ label, onClick, disabled, unavailable, title }: { label: string; onClick?: () => void; disabled?: boolean; unavailable?: boolean; title?: string }) {
   return (
     <button
       type="button"
       className={`command${unavailable ? " unavailable" : ""}`}
       disabled={unavailable || disabled}
-      title={unavailable ? UNAVAILABLE : undefined}
+      title={unavailable ? UNAVAILABLE : title}
       aria-label={unavailable ? `${label} (${UNAVAILABLE.toLowerCase()})` : undefined}
       onClick={onClick}
     >
@@ -77,17 +86,17 @@ export default function Ribbon(props: Props) {
         {tab === "home" ? (
           <>
             <Group label="Clipboard">
-              <Command label="Copy" unavailable />
-              <Command label="Cut" unavailable />
-              <Command label="Paste" unavailable />
+              <Command label="Copy" disabled={!props.hasSelection} onClick={props.onCopy} />
+              <Command label="Cut" disabled={!props.hasSelection} onClick={props.onCut} />
+              <Command label="Paste" disabled={!props.canPaste} onClick={props.onPaste} />
             </Group>
             <Group label="Organize">
               <Command label="Move to" unavailable />
-              <Command label="Delete" unavailable />
-              <Command label="Rename" unavailable />
+              <Command label="Delete" disabled={!props.hasSelection} onClick={props.onTrash} title="Moves the selection to the Trash" />
+              <Command label="Rename" disabled={!props.canRename} onClick={props.onRename} />
             </Group>
             <Group label="New">
-              <Command label="New folder" unavailable />
+              <Command label="New folder" disabled={!props.canCreate} onClick={props.onNewFolder} />
             </Group>
             <Group label="Open">
               <Command label="Open" disabled={!props.canOpen} onClick={props.onOpen} />

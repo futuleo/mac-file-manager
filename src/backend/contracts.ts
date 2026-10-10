@@ -70,11 +70,36 @@ export interface ItemFailure {
   error: AppError;
 }
 
+/** What `completed`/`total` count: items (folders, trash) or bytes of file data. */
+export type ProgressUnit = "items" | "bytes";
+
+/** Outcome of a task. `failed` is capped; `failedOmitted` counts the rest. `affected` are the folder ids whose contents changed. */
+export interface TaskSummary {
+  succeeded: number;
+  skipped: number;
+  failed: ItemFailure[];
+  failedOmitted: number;
+  affected: string[];
+}
+
+/** A task ends with exactly one of `finished`, `cancelled` or `failed`. Cancelling never rolls back finished items. */
 export type TaskEvent =
-  | { type: "progress"; taskId: string; stage: TaskStage; completed: number | null; total: number | null }
-  | { type: "conflict"; taskId: string; conflictId: string; sourceId: string; destinationId: string }
-  | { type: "finished"; taskId: string; succeeded: number; failed: ItemFailure[] }
-  | { type: "cancelled"; taskId: string; succeeded: number }
+  | { type: "progress"; taskId: string; stage: TaskStage; completed: number | null; total: number | null; unit: ProgressUnit }
+  | {
+      type: "conflict";
+      taskId: string;
+      conflictId: string;
+      sourceId: string;
+      destinationId: string;
+      sourceName: string;
+      destinationName: string;
+      sourceKind: EntryKind;
+      destinationKind: EntryKind;
+      /** The destination is the source itself (e.g. copy into its own folder). */
+      sameItem: boolean;
+    }
+  | ({ type: "finished"; taskId: string } & TaskSummary)
+  | ({ type: "cancelled"; taskId: string } & TaskSummary)
   | { type: "failed"; taskId: string; error: AppError };
 
 export type SearchMode = "filename" | "content";
@@ -121,6 +146,23 @@ export interface ImplementedCommands {
   open_item: { args: { id: string }; result: void };
   /** PNG data URL of the system icon; `size` is a pixel hint (8-256). */
   get_icon: { args: { id: string; size: number }; result: string };
+  /** Returns once queued; progress, conflicts and the result arrive on TASK_EVENT tagged with `taskId`. */
+  start_transfer: {
+    args: { taskId: string; moveItems: boolean; sourceIds: string[]; destinationId: string };
+    result: void;
+  };
+  /** Moves to the macOS Trash (recoverable); there is no permanent delete. */
+  trash_items: { args: { taskId: string; ids: string[] }; result: void };
+  /** Answers a `conflict` event; rejects if it is no longer pending. */
+  resolve_conflict: { args: { conflictId: string; decision: ConflictDecision; applyToAll: boolean }; result: void };
+  /** Idempotent; stops future work without rolling back. */
+  cancel_task: { args: { taskId: string }; result: void };
+  /** `name` null picks "New folder", "New folder 2", ... Never overwrites. */
+  create_folder: { args: { parentId: string; name: string | null }; result: FileEntry };
+  /** Same-folder rename that never replaces another item. */
+  rename_item: { args: { id: string; newName: string }; result: FileEntry };
+  /** Applies copy/cut/paste/selectAll to the focused text field. */
+  edit_action: { args: { action: "copy" | "cut" | "paste" | "selectAll" }; result: void };
 }
 
 /**
@@ -131,9 +173,5 @@ export interface ImplementedCommands {
 export interface PlannedCommands {
   start_search: { args: { searchId: string; scopeId: string; mode: SearchMode; query: string }; result: void }; // spotlight-search; results via SEARCH_EVENT
   cancel_search: { args: { searchId: string }; result: void };
-  start_copy: { args: { sourceIds: string[]; destinationId: string }; result: string }; // file-operations; returns taskId, progress via TASK_EVENT
-  resolve_conflict: { args: { conflictId: string; decision: ConflictDecision; applyToAll: boolean }; result: void };
-  cancel_task: { args: { taskId: string }; result: void };
-  trash_items: { args: { ids: string[] }; result: string };
   show_quick_look: { args: { ids: string[] }; result: void }; // quick-look
 }

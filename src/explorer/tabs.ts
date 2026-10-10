@@ -41,7 +41,7 @@ export type TabAction =
   | { type: "navigate"; tabId: string; location: Location; reveal?: string | null; ifNav?: number }
   | { type: "back"; tabId: string }
   | { type: "forward"; tabId: string }
-  | { type: "reload"; tabId: string }
+  | { type: "reload"; tabId: string; reveal?: string | null }
   | { type: "entries"; tabId: string; nav: number; entries: FileEntry[]; failures: ItemFailure[] }
   | { type: "finished"; tabId: string; nav: number }
   | { type: "failed"; tabId: string; nav: number; error: AppError }
@@ -128,7 +128,7 @@ export function tabsReducer(state: TabsState, action: TabAction): TabsState {
       );
     case "reload":
       return update(state, action.tabId, (tab) =>
-        hist.current(tab.history) ? restart(tab, tab.history, true) : tab,
+        hist.current(tab.history) ? { ...restart(tab, tab.history, true), reveal: action.reveal ?? null } : tab,
       );
     case "entries":
       return update(state, action.tabId, (tab) =>

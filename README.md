@@ -5,9 +5,11 @@ The Tauri 2 + React/TypeScript + Rust foundation, the read-only **filesystem
 backend** and the **Explorer UI shell** exist: tab strip, ribbon-inspired
 command area, back/forward/up/refresh, breadcrumb/address bar, sidebar of real
 locations, a virtualized details list (Name / Date modified / Type / Size) and a
-status bar, all wired to the real backend commands. Search, preview, file
-operations (copy/move/delete/rename/new folder) and drag-and-drop are **not
-implemented**; their controls are shown disabled ("Not available yet").
+status bar, all wired to the real backend commands. **File operations** (new
+folder, copy, cut/paste move, rename, Move to the Trash) are implemented; see
+[File operations](#file-operations). Search, preview, Finder drag-and-drop,
+Properties and "Move to" are **not implemented**; their controls are shown
+disabled ("Not available yet").
 
 See [plan.md](plan.md) for product scope and implementation tasks.
 See [.github/AUTONOMY.md](.github/AUTONOMY.md) for the writer/reviewer/fix/merge
@@ -67,6 +69,9 @@ The `--no-bundle` build produces `src-tauri/target/release/mac-file-manager`
   `FileList` (virtualized grid), `NavBar`, `Sidebar`, `TabStrip`, `Ribbon`,
   `ContextMenu`, `StatusBar`; `src/iconQueue.ts` + `FileIcon.tsx` – lazy,
   bounded, cancellable icons; `src/PlatformPanel.tsx` – native class presence.
+- `src-tauri/src/operations.rs` (+ `operations/tests.rs`) – file-operation engine;
+  `src-tauri/src/tasks.rs` – task registry (cancel, conflict answers);
+  `src/operations/` (model + `useOperations` hook), `OperationsPanel`, `NameDialog`.
 - `src-tauri/src/macos.rs` – native bridge (objc2). `menu.rs` – native menu bar;
   actions for later slices appear disabled with their Command shortcuts.
 - `src-tauri/examples/` – feasibility spikes, not shipped:
@@ -235,3 +240,25 @@ Design consequences and limits:
   `screencapture` and window inspection were unavailable, so the real
   WebView↔backend IPC, native menu events and the final visual appearance are
   **unverified** on this machine. macOS 12.0 as deployment target is untested.
+
+## File operations
+
+All work runs in Rust off the UI thread (`start_transfer`, `trash_items`,
+`create_folder`, `rename_item`, `cancel_task`, `resolve_conflict`) and reports
+`TaskEvent`s to the window that started it; the frontend only sends opaque path
+ids. Toolbar, context menu and native menu share one service.
+
+- **New folder** (⇧⌘N): creates a uniquely named folder ("New folder", "New folder 2"…) and asks for its name.
+- **Copy / Cut / Paste** (⌘C / ⌘X / ⌘V): the clipboard is **internal to the app** (it holds item ids). It is *not* shared with Finder or other apps and does not exchange files; in text fields the menu actions go to the field. Cut + Paste is a move.
+- **Rename** (F2 or context menu): one item; validated name, never overwrites (atomic `RENAME_EXCL`); case-only renames work.
+- **Move to the Trash** (⌘⌫, context menu, "Delete"): uses `NSFileManager.trashItemAtURL`; there is **no permanent deletion**.
+- **Conflicts**: never overwritten silently. Choose Skip, Keep both (numbered name) or Replace (files only; the old file goes to the Trash), optionally for all remaining conflicts. Folders are never merged or replaced. Conflicts are re-checked at execution time.
+- **Safety**: copying/moving an item into itself or a descendant is rejected; symlinks are copied/moved as links, never followed; a cross-volume move copies first and deletes only sources that copied successfully.
+- **Progress and cancellation**: measured bytes (copy/move) or items; "Counting items…" while the total is unknown, never an invented percentage. Cancel stops further work; it does **not** roll back what was already done, and the result says so. Partial failures list the failed items (capped; the rest is counted).
+- **Refresh**: only tabs showing an affected folder reload; events are matched by task id.
+
+Limitations: cross-volume moves (EXDEV fallback) are tested only by driving the
+fallback on one volume, not with a real second volume; no Full Disk Access is
+requested, so protected folders report permission errors; Trash and menu
+behavior have been checked by automated tests with owned temporary fixtures,
+see the PR for GUI acceptance evidence. Copies preserve extended attributes, ACLs and mode on a best-effort basis (failures to copy this metadata are not reported).

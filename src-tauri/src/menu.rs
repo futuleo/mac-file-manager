@@ -1,7 +1,8 @@
 //! Native macOS menu bar. Navigation and tab commands are enabled and forwarded to
 //! the frontend as `MENU_EVENT` (the Command key equivalents are consumed by the
-//! menu, so the page never sees them). Commands that later slices implement are
-//! present with their standard shortcuts but disabled, so nothing pretends to work.
+//! menu, so the page never sees them). Cut/Copy/Paste are forwarded too: the
+//! frontend applies them to files, or hands them back through `edit_action` when a
+//! text field has focus.
 
 use tauri::{
     AppHandle, Emitter, Manager, Wry,
@@ -11,7 +12,7 @@ use tauri::{
 use crate::contracts::MENU_EVENT;
 
 /// Menu item ids the frontend acts on (see `src/App.tsx`).
-const FORWARDED: [&str; 13] = [
+const FORWARDED: [&str; 19] = [
     "new-tab",
     "close-tab",
     "next-tab",
@@ -25,6 +26,12 @@ const FORWARDED: [&str; 13] = [
     "home",
     "address",
     "hidden-items",
+    "new-folder",
+    "copy",
+    "cut",
+    "paste",
+    "rename",
+    "trash",
 ];
 
 pub fn forward(app: &AppHandle, event: MenuEvent) {
@@ -45,15 +52,6 @@ fn enabled(
     accelerator: &str,
 ) -> tauri::Result<MenuItem<Wry>> {
     MenuItem::with_id(app, id, text, true, Some(accelerator))
-}
-
-fn planned(
-    app: &AppHandle,
-    id: &str,
-    text: &str,
-    accelerator: &str,
-) -> tauri::Result<MenuItem<Wry>> {
-    MenuItem::with_id(app, id, text, false, Some(accelerator))
 }
 
 pub fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
@@ -79,9 +77,11 @@ pub fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         true,
         &[
             &enabled(app, "new-tab", "New Tab", "CmdOrCtrl+T")?,
-            &planned(app, "new-folder", "New Folder", "Shift+CmdOrCtrl+N")?,
+            &enabled(app, "new-folder", "New Folder", "Shift+CmdOrCtrl+N")?,
             &PredefinedMenuItem::separator(app)?,
             &enabled(app, "open", "Open", "CmdOrCtrl+O")?,
+            &MenuItem::with_id(app, "rename", "Rename", true, None::<&str>)?,
+            &enabled(app, "trash", "Move to Trash", "CmdOrCtrl+Backspace")?,
             &PredefinedMenuItem::separator(app)?,
             &enabled(app, "close-tab", "Close Tab", "CmdOrCtrl+W")?,
             &enabled(app, "close-window", "Close Window", "Shift+CmdOrCtrl+W")?,
@@ -95,9 +95,9 @@ pub fn build(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
             &PredefinedMenuItem::undo(app, None)?,
             &PredefinedMenuItem::redo(app, None)?,
             &PredefinedMenuItem::separator(app)?,
-            &PredefinedMenuItem::cut(app, None)?,
-            &PredefinedMenuItem::copy(app, None)?,
-            &PredefinedMenuItem::paste(app, None)?,
+            &enabled(app, "cut", "Cut", "CmdOrCtrl+X")?,
+            &enabled(app, "copy", "Copy", "CmdOrCtrl+C")?,
+            &enabled(app, "paste", "Paste", "CmdOrCtrl+V")?,
             &enabled(app, "select-all", "Select All", "CmdOrCtrl+A")?,
         ],
     )?;
