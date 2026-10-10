@@ -3,10 +3,10 @@ import type { FileEntry } from "../backend/contracts";
 import * as hist from "./history";
 import { ancestors, parentOf } from "./path";
 import { defaultPreferences, parsePreferences } from "./preferences";
-import { emptySelection, extendTo, invert, move, prune, selectAll, selectOnly, toggle } from "./selection";
+import { emptySelection, extendTo, invert, marqueeSelection, move, prune, selectAll, selectOnly, toggle } from "./selection";
 import { formatEntrySize, nextSort, sortEntries, typeLabel } from "./sort";
 import { initialTabsState, MAX_TABS, tabsReducer, type TabsState } from "./tabs";
-import { scrollTopFor, visibleRange } from "./virtual";
+import { rowsInBand, scrollTopFor, visibleRange } from "./virtual";
 
 const hex = (path: string) => Array.from(new TextEncoder().encode(path), (b) => b.toString(16).padStart(2, "0")).join("");
 const loc = (path: string) => ({ id: hex(path), path, name: path.slice(path.lastIndexOf("/") + 1) || "/" });
@@ -243,5 +243,37 @@ describe("tab search state", () => {
     s = tabsReducer(s, { type: "search-state", tabId: "tab-1", key: 1, state: "live" });
     s = tabsReducer(s, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("1")], skipped: 0 });
     expect(s.tabs[0]!.search).toMatchObject({ status: "failed", error, entries: [] });
+  });
+});
+
+describe("marquee model", () => {
+  const rows = Array.from({ length: 6 }, (_, i) => ({ id: `r${i}` }) as FileEntry);
+  const base = { ids: new Set(["r0", "r1"]), anchor: "r0", focus: "r1" };
+
+  it("maps a vertical band to inclusive row indexes, clamped to the list", () => {
+    expect(rowsInBand(0, 23, 6)).toEqual({ first: 0, last: 0 });
+    expect(rowsInBand(30, 100, 6)).toEqual({ first: 1, last: 4 });
+    expect(rowsInBand(100, 30, 6)).toEqual({ first: 1, last: 4 });
+    expect(rowsInBand(-50, 30, 6)).toEqual({ first: 0, last: 1 });
+    expect(rowsInBand(100, 5000, 6)).toEqual({ first: 4, last: 5 });
+    expect(rowsInBand(-50, -1, 6)).toBeNull();
+    expect(rowsInBand(144, 300, 6)).toBeNull();
+    expect(rowsInBand(0, 10, 0)).toBeNull();
+  });
+
+  it("replace, add and toggle modes follow selection conventions", () => {
+    const band = { first: 1, last: 3 };
+    expect([...marqueeSelection(rows, base, band, "replace", true).ids]).toEqual(["r1", "r2", "r3"]);
+    expect([...marqueeSelection(rows, base, band, "add", true).ids].sort()).toEqual(["r0", "r1", "r2", "r3"]);
+    expect([...marqueeSelection(rows, base, band, "toggle", true).ids].sort()).toEqual(["r0", "r2", "r3"]);
+    expect(marqueeSelection(rows, base, null, "replace", true).ids.size).toBe(0);
+    expect(marqueeSelection(rows, base, null, "toggle", true).ids).toEqual(base.ids);
+  });
+
+  it("anchors at the start side and leaves focus for the end of the gesture", () => {
+    const band = { first: 2, last: 4 };
+    expect(marqueeSelection(rows, base, band, "replace", true)).toMatchObject({ anchor: "r2", focus: "r1" });
+    expect(marqueeSelection(rows, base, band, "replace", false)).toMatchObject({ anchor: "r4", focus: "r1" });
+    expect(marqueeSelection(rows, base, null, "add", true).anchor).toBe("r0");
   });
 });

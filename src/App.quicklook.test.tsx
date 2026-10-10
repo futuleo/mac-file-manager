@@ -186,6 +186,24 @@ describe("Quick Look UI (mocked IPC)", () => {
     await waitFor(() => expect(called("quick_look_sync").slice(-1)[0]!.args).toMatchObject({ ids: [] }));
   });
 
+  it("a marquee drag re-targets an open preview and keeps tabs independent", async () => {
+    await start();
+    select("a.txt");
+    menu("quick-look");
+    await waitFor(() => expect(called("quick_look_toggle").length).toBe(1));
+    await act(async () => { await Promise.resolve(); });
+    const grid = screen.getByRole("grid");
+    grid.getBoundingClientRect = () => ({ left: 0, top: 0, right: 400, bottom: 400, width: 400, height: 400, x: 0, y: 0, toJSON() {} });
+    Object.defineProperty(grid, "clientWidth", { configurable: true, value: 385 });
+    Object.defineProperty(grid, "clientHeight", { configurable: true, value: 400 });
+    fireEvent.mouseDown(grid, { button: 0, buttons: 1, clientX: 300, clientY: 200 });
+    fireEvent.mouseMove(window, { buttons: 1, clientX: 300, clientY: 26 });
+    fireEvent.mouseUp(window);
+    await waitFor(() => expect(called("quick_look_sync").slice(-1)[0]!.args).toMatchObject({ ids: [a.id, b.id] }));
+    fireEvent.click(screen.getByRole("button", { name: "New tab" }));
+    await waitFor(() => expect(called("quick_look_sync").slice(-1)[0]!.args).toMatchObject({ ids: [] }));
+  });
+
   it("shows a typed preview error instead of pretending it opened", async () => {
     await start();
     select("a.txt");

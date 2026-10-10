@@ -3,9 +3,20 @@ import type { FileEntry } from "./backend/contracts";
 import FileIcon from "./FileIcon";
 import { SortGlyph } from "./glyphs";
 import { COLUMN_LIMITS, type ColumnWidths } from "./explorer/preferences";
-import { extendTo, move, selectAll, selectOnly, toggle, type Movement, type Selection } from "./explorer/selection";
+import {
+  extendTo,
+  marqueeSelection,
+  move,
+  sameIds,
+  selectAll,
+  selectOnly,
+  toggle,
+  type MarqueeMode,
+  type Movement,
+  type Selection,
+} from "./explorer/selection";
 import { formatDate, formatEntrySize, typeLabel, type SortKey, type SortState } from "./explorer/sort";
-import { HEADER_HEIGHT, ROW_HEIGHT, scrollTopFor, visibleRange } from "./explorer/virtual";
+import { HEADER_HEIGHT, ROW_HEIGHT, rowsInBand, scrollTopFor, visibleRange } from "./explorer/virtual";
 
 const COLUMNS: { key: SortKey; label: string }[] = [
   { key: "name", label: "Name" },
@@ -38,6 +49,28 @@ interface Props {
   showLocation?: boolean;
 }
 
+/** Pointer travel before a press on empty space becomes a rectangle selection. */
+const MARQUEE_THRESHOLD = 4;
+/** Distance from a scroll edge where autoscroll starts, and its speed bounds (px per tick). */
+const AUTOSCROLL_EDGE = 20;
+const AUTOSCROLL_MIN = 2;
+const AUTOSCROLL_MAX = 40;
+const AUTOSCROLL_TICK_MS = 16;
+
+interface MarqueeGesture {
+  /** Stops the gesture. `restore` puts the pre-gesture selection back; `commit` finalizes focus. */
+  end(how: "commit" | "restore" | "drop"): void;
+}
+
+interface MarqueeBox {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+const edgeSpeed = (depth: number) => Math.min(AUTOSCROLL_MAX, AUTOSCROLL_MIN + Math.max(0, depth) / 2);
+
 /** Display-only parent of an entry's path. */
 function containingFolder(entry: FileEntry): string {
   const cut = entry.path.lastIndexOf("/");
@@ -51,6 +84,19 @@ function FileList(props: Props) {
   const [viewport, setViewport] = useState(0);
   const rowsRef = useRef(rows);
   rowsRef.current = rows;
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
+  const onSelectRef = useRef(props.onSelect);
+  onSelectRef.current = props.onSelect;
+  const gesture = useRef<MarqueeGesture | null>(null);
+  const suppressClick = useRef(false);
+  const [marquee, setMarquee] = useState<MarqueeBox | null>(null);
+
+  // A gesture never outlives the list it started on (refresh, sort, new results) or the component.
+  useEffect(() => () => gesture.current?.end("drop"), []);
+  useEffect(() => {
+    gesture.current?.end("drop");
+  }, [rows]);
 
   useLayoutEffect(() => {
     const el = scroller.current;
@@ -164,6 +210,129 @@ function FileList(props: Props) {
     else props.onSelect(selectOnly(entry.id));
   };
 
+  const startMarquee = (event: React.MouseEvent<HTMLDivElement>) => {
+    gesture.current?.end("commit");
+    const el = scroller.current;
+    const target = event.target as HTMLElement;
+    if (!el || event.button !== 0 || event.ctrlKey || target.closest(".header")) return;
+    const emptySpace =
+      target === el || target.classList.contains("body") || target.classList.contains("empty") || target.classList.contains("filler");
+    if (!emptySpace) return;
+    const box = el.getBoundingClientRect();
+    // Presses on the scrollbars belong to the scrollbars.
+    if (event.clientX >= box.left + el.clientWidth || event.clientY >= box.top + el.clientHeight) return;
+
+    event.preventDefault();
+    el.focus();
+    const mode: MarqueeMode = event.shiftKey ? "add" : event.metaKey ? "toggle" : "replace";
+    const base = selectionRef.current;
+    const toContent = (cx: number, cy: number) => {
+      const r = el.getBoundingClientRect();
+      return { x: cx - r.left + el.scrollLeft, y: cy - r.top + el.scrollTop - HEADER_HEIGHT };
+    };
+    const origin = toContent(event.clientX, event.clientY);
+    let pointer = { x: event.clientX, y: event.clientY };
+    let active = false;
+    let latest = base;
+    let far: string | null = null;
+
+    const update = () => {
+      const now = toContent(pointer.x, pointer.y);
+      if (!active) {
+        if (Math.hypot(now.x - origin.x, now.y - origin.y) < MARQUEE_THRESHOLD) return;
+        active = true;
+      }
+      const list = rowsRef.current;
+      const band = rowsInBand(origin.y, now.y, list.length);
+      const forward = now.y >= origin.y;
+      far = band ? list[forward ? band.last : band.first]!.id : null;
+      const next = marqueeSelection(list, base, band, mode, forward);
+      if (!sameIds(next.ids, latest.ids) || next.anchor !== latest.anchor) {
+        latest = next;
+        onSelectRef.current(next);
+      }
+      const maxX = el.scrollWidth;
+      const maxY = el.scrollHeight - HEADER_HEIGHT;
+      const x0 = Math.max(0, Math.min(origin.x, now.x));
+      const x1 = Math.min(maxX, Math.max(origin.x, now.x));
+      const y0 = Math.max(0, Math.min(origin.y, now.y));
+      const y1 = Math.min(maxY, Math.max(origin.y, now.y));
+      setMarquee({ left: x0, top: y0 + HEADER_HEIGHT, width: Math.max(0, x1 - x0), height: Math.max(0, y1 - y0) });
+    };
+
+    const autoscroll = () => {
+      if (!active) return;
+      const r = el.getBoundingClientRect();
+      const top = r.top + HEADER_HEIGHT;
+      const bottom = r.top + el.clientHeight;
+      const right = r.left + el.clientWidth;
+      let dx = 0;
+      let dy = 0;
+      if (pointer.y < top + AUTOSCROLL_EDGE) dy = -edgeSpeed(top + AUTOSCROLL_EDGE - pointer.y);
+      else if (pointer.y > bottom - AUTOSCROLL_EDGE) dy = edgeSpeed(pointer.y - (bottom - AUTOSCROLL_EDGE));
+      if (pointer.x < r.left + AUTOSCROLL_EDGE) dx = -edgeSpeed(r.left + AUTOSCROLL_EDGE - pointer.x);
+      else if (pointer.x > right - AUTOSCROLL_EDGE) dx = edgeSpeed(pointer.x - (right - AUTOSCROLL_EDGE));
+      if (dx === 0 && dy === 0) return;
+      const before = { x: el.scrollLeft, y: el.scrollTop };
+      el.scrollLeft = Math.max(0, before.x + dx);
+      el.scrollTop = Math.max(0, before.y + dy);
+      if (el.scrollLeft !== before.x || el.scrollTop !== before.y) {
+        // Scroll events may lag a tick; keep the virtual window in step directly.
+        setScrollTop(el.scrollTop);
+        props.onScrollTop(el.scrollTop);
+        update();
+      }
+    };
+
+    const onMove = (e: MouseEvent) => {
+      if (e.buttons === 0) return end("commit"); // the release happened outside the window
+      pointer = { x: e.clientX, y: e.clientY };
+      update();
+    };
+    const onUp = () => end("commit");
+    const onDown = () => end("commit");
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        end("restore");
+      }
+    };
+    const onBlur = () => end("commit");
+    const timer = window.setInterval(autoscroll, AUTOSCROLL_TICK_MS);
+
+    function end(how: "commit" | "restore" | "drop") {
+      if (gesture.current !== handle) return;
+      gesture.current = null;
+      window.clearInterval(timer);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("mousedown", onDown, true);
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("blur", onBlur);
+      if (active) {
+        // The release after a drag must not count as a click on empty space.
+        suppressClick.current = true;
+        window.setTimeout(() => {
+          suppressClick.current = false;
+        }, 0);
+      }
+      setMarquee(null);
+      if (how === "drop" || !active) return;
+      if (how === "restore") onSelectRef.current(base);
+      else if (far !== null && rowsRef.current.some((r) => r.id === far)) {
+        onSelectRef.current({ ...latest, focus: far });
+      }
+    }
+    const handle: MarqueeGesture = { end };
+    gesture.current = handle;
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    window.addEventListener("mousedown", onDown, true);
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("blur", onBlur);
+  };
+
   const contextRow = (event: React.MouseEvent, entry: FileEntry | null) => {
     event.preventDefault();
     event.stopPropagation();
@@ -265,6 +434,13 @@ function FileList(props: Props) {
       onScroll={setScroll}
       onKeyDown={onKeyDown}
       onContextMenu={(e) => contextRow(e, null)}
+      onMouseDown={startMarquee}
+      onClickCapture={(e) => {
+        if (suppressClick.current) {
+          suppressClick.current = false;
+          e.stopPropagation();
+        }
+      }}
       onClick={(e) => {
         if (e.target === e.currentTarget || (e.target as HTMLElement).classList.contains("body")) {
           props.onSelect({ ids: new Set(), anchor: null, focus: selection.focus });
@@ -313,6 +489,7 @@ function FileList(props: Props) {
       <div className="body" style={{ height: rows.length * ROW_HEIGHT, minWidth: width }}>
         {mounted}
       </div>
+      {marquee && <div className="marquee" aria-hidden="true" style={marquee} />}
       {props.emptyMessage && (
         <p className="empty" role="status">
           {props.emptyMessage}

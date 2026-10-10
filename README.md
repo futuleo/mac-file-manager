@@ -9,7 +9,8 @@ status bar, all wired to the real backend commands. **File operations** (new
 folder, copy, cut/paste move, rename, Move to the Trash) are implemented; see
 [File operations](#file-operations). **Spotlight search** of the current folder
 (filenames or contents) is implemented; see [Search](#search). **Quick Look** preview
-is implemented; see [Quick Look](#quick-look). Finder
+is implemented; see [Quick Look](#quick-look). **Mouse rectangle selection** is
+implemented; see [Explorer UI](#explorer-ui). Finder
 drag-and-drop, Properties and "Move to" are **not implemented**; their controls are shown
 disabled ("Not available yet").
 
@@ -122,6 +123,24 @@ only (API available), not exercised behavior; external dragging is untested.
   PageUp / PageDown (⇧ extends), ⌘A, Esc clears; context menu via right click,
   the Menu key or ⇧F10. Sorting by clicking the headers or from the View tab; ⇧⌘.
   toggles hidden items. Column widths are resizable (drag or ←/→ on the handle).
+- **Rectangle (marquee) selection**: press the left button on empty list space (below
+  the last row, in a row's blank area right of the columns, or in the empty-folder area),
+  then drag; the rows the rectangle touches vertically are selected live. The press must
+  not be on a file name/cells, the header or a scrollbar, and a Control-click is a context
+  menu, not a selection. Without a modifier the touched rows replace the selection;
+  ⇧ adds them to it; ⌘ toggles them against the selection from before the drag (like
+  ⌘-click). The modifier is read at the press. A press that moves less than 4 px is an
+  ordinary click (empty space clears the selection; a row's blank area selects the row).
+  Holding the pointer near the top or bottom (or left/right) edge autoscrolls, faster the
+  further out it is; only visible rows are mounted, so the rectangle is computed from row
+  geometry and also selects rows scrolled past. Esc during a drag restores the selection
+  from before it. Releasing (even outside the window), losing window focus, another mouse
+  press, a refreshed/re-sorted list or new search results, closing the tab, or navigating ends
+  the gesture without a stale rectangle; the selection keeps what it had. Keyboard focus
+  moves to the row at the pointer end on release. Each tab keeps its own selection, and an
+  open Quick Look panel follows the changing selection as it does for clicks. Search
+  results use the same behavior. Dragging selected files (planned drag-and-drop) is a separate
+  gesture on rows and is not implemented; its integration with this selection is pending.
 - Native menu items are forwarded to the UI as `menu-action` events because macOS
   consumes the accelerators before the WebView.
 - **Persistence**: only sort, hidden-items and column widths (`localStorage`,
@@ -295,6 +314,9 @@ Design consequences and limits:
 - Vitest (jsdom, **mocked IPC**): independent tabs and history, invalid/valid
   address, stale and closed-tab read events, sorting and selection invariants,
   keyboard selection, context menus, errors and a 5000-row virtualization test.
+  Marquee selection has jsdom tests with **faked geometry** (`FileList.marquee.test.tsx`:
+  modifiers, thresholds, excluded start areas, virtualized rows, autoscroll, Escape,
+  disposal) and a mocked-IPC Quick Look/tab test; the native check is described below.
   These prove frontend logic only, not real WebView/IPC behavior.
 - Rust: 33 tests, including the new `resolve_directory`/`list_places` cases and
   the Tauri mock-runtime command test.
