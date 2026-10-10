@@ -4,14 +4,21 @@ import { FileGlyph, FolderGlyph } from "./glyphs";
 import { cachedIcon, requestIcon } from "./iconQueue";
 
 /**
- * An original placeholder glyph, replaced by the real system icon once the row is
- * (nearly) visible and a bounded-concurrency lookup completes.
+ * Folders always render the original yellow FolderGlyph (Windows 10 baseline); the native
+ * (blue) system folder icon is never requested, cached or shown. Files show an original
+ * placeholder glyph, replaced by the real system icon once the row is (nearly) visible and
+ * a bounded-concurrency lookup completes.
  */
 export default function FileIcon({ id, kind, size = 16 }: { id: string; kind: EntryKind; size?: number }) {
   const ref = useRef<HTMLSpanElement>(null);
-  const [src, setSrc] = useState<string | null>(cachedIcon(id, size * 2));
+  const isFolder = kind === "directory";
+  const [src, setSrc] = useState<string | null>(isFolder ? null : cachedIcon(id, size * 2));
 
   useEffect(() => {
+    if (isFolder) {
+      setSrc(null);
+      return;
+    }
     setSrc(cachedIcon(id, size * 2));
     let cancel = () => {};
     let observer: IntersectionObserver | null = null;
@@ -35,14 +42,14 @@ export default function FileIcon({ id, kind, size = 16 }: { id: string; kind: En
       observer?.disconnect();
       cancel();
     };
-  }, [id, size]);
+  }, [id, size, isFolder]);
 
   return (
     <span ref={ref} className="icon" style={{ width: size, height: size }} aria-hidden="true">
-      {src ? (
-        <img src={src} width={size} height={size} alt="" draggable={false} />
-      ) : kind === "directory" ? (
+      {isFolder ? (
         <FolderGlyph size={size} />
+      ) : src ? (
+        <img src={src} width={size} height={size} alt="" draggable={false} />
       ) : (
         <FileGlyph size={size} />
       )}
