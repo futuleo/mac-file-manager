@@ -4,7 +4,7 @@
 
 The user authorized configuring the full autonomous writer/reviewer/fix/merge cycle.
 The scaffold, read-only filesystem backend and Explorer UI shell are implemented.
-File operations, search, preview and drag-and-drop remain unimplemented.
+File operations (folder creation, copy, move, rename, Trash) are implemented; search, preview and drag-and-drop remain unimplemented.
 Before implementing, reread this file, including any user edits.
 
 This repository file is the source of truth for the implementation plan.

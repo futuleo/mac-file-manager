@@ -22,6 +22,7 @@ interface Props {
   onSelect(selection: Selection): void;
   onActivate(entry: FileEntry): void;
   onContextMenu(entry: FileEntry | null, x: number, y: number): void;
+  onRename(): void;
   onRetry(): void;
   onBack(): void;
   onDismissAction(): void;
@@ -117,6 +118,7 @@ export default function TabView(props: Props) {
           onSelect={props.onSelect}
           onActivate={props.onActivate}
           onContextMenu={props.onContextMenu}
+          onRename={props.onRename}
         />
       )}
     </div>

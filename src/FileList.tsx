@@ -32,6 +32,7 @@ interface Props {
   onSelect(selection: Selection): void;
   onActivate(entry: FileEntry): void;
   onContextMenu(entry: FileEntry | null, x: number, y: number): void;
+  onRename(): void;
 }
 
 function FileList(props: Props) {
@@ -118,7 +119,10 @@ function FileList(props: Props) {
       props.onSelect(move(rows, selection, movement, event.shiftKey));
       return;
     }
-    if (event.key === "Enter" && !cmd) {
+    if (event.key === "F2" && !cmd) {
+      event.preventDefault();
+      props.onRename();
+    } else if (event.key === "Enter" && !cmd) {
       const entry = focusIndex >= 0 ? rows[focusIndex] : undefined;
       if (entry) {
         event.preventDefault();

@@ -360,10 +360,11 @@ describe("App (mocked IPC)", () => {
     fireEvent.contextMenu(rowFor("Docs"));
     const menuEl = await screen.findByRole("menu");
     expect(within(menuEl).getByText("Open")).toBeTruthy();
-    const del = within(menuEl).getByText("Delete").closest("li")!;
-    expect(del.getAttribute("aria-disabled")).toBe("true");
-    fireEvent.click(del);
+    const props = within(menuEl).getByText("Properties").closest("li")!;
+    expect(props.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(props);
     expect(opened.length).toBe(0);
+    expect(within(menuEl).queryByText("Delete")).toBeNull();
     fireEvent.click(within(menuEl).getByText("Open in new tab"));
     await waitForRead(2);
     expect(tabs().length).toBe(2);
