@@ -33,6 +33,7 @@ interface Props {
   onActivate(entry: FileEntry): void;
   onContextMenu(entry: FileEntry | null, x: number, y: number): void;
   onRename(): void;
+  onQuickLook(): void;
   /** Search results come from many folders, so each row also shows its containing folder. */
   showLocation?: boolean;
 }
@@ -127,7 +128,10 @@ function FileList(props: Props) {
       props.onSelect(move(rows, selection, movement, event.shiftKey));
       return;
     }
-    if (event.key === "F2" && !cmd) {
+    if (event.key === " " && !cmd && !event.shiftKey) {
+      event.preventDefault();
+      props.onQuickLook();
+    } else if (event.key === "F2" && !cmd) {
       event.preventDefault();
       props.onRename();
     } else if (event.key === "Enter" && !cmd) {

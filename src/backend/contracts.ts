@@ -180,6 +180,20 @@ export interface ImplementedCommands {
   cancel_search: { args: { searchId: string }; result: void };
   /** Applies copy/cut/paste/selectAll to the focused text field. */
   edit_action: { args: { action: "copy" | "cut" | "paste" | "selectAll" }; result: void };
+  /**
+   * Toggles the native macOS Quick Look panel of the calling window for 1-50 existing items.
+   * `seq` orders the window's toggle/sync calls (it must grow); a call superseded by a newer
+   * one changes nothing and reports the panel as it is.
+   * Resolves true when the panel is now showing them and false when it was closed. Rejects with
+   * `invalidInput`/`notFound`/`permissionDenied` (nothing is shown) or `unsupported` (no native panel).
+   */
+  quick_look_toggle: { args: { seq: number; ids: string[] }; result: boolean };
+  /**
+   * Points an open panel at the current selection. A no-op (false) when this window is not
+   * showing it; an empty selection closes it. A selection that can no longer be previewed closes
+   * the panel and rejects with the same errors as `quick_look_toggle`.
+   */
+  quick_look_sync: { args: { seq: number; ids: string[] }; result: boolean };
 }
 
 /**
@@ -187,6 +201,4 @@ export interface ImplementedCommands {
  * `ImplementedCommands`, so the client cannot call them until the backend exists.
  * Rejections carry an `AppError`.
  */
-export interface PlannedCommands {
-  show_quick_look: { args: { ids: string[] }; result: void }; // quick-look
-}
+export type PlannedCommands = Record<never, never>;

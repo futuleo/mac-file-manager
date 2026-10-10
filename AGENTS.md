@@ -3,7 +3,7 @@
 ## Project
 
 - This repository is a macOS file manager project.
-- The repository contains a Tauri 2 + React/TypeScript + Rust scaffold, a read-only filesystem backend and an Explorer UI shell. File operations (new folder, copy, move, rename, Trash) are implemented; Spotlight search of the current folder is implemented; preview and drag-and-drop are not implemented yet; see `plan.md` and `README.md` for the documented build and check commands.
+- The repository contains a Tauri 2 + React/TypeScript + Rust scaffold, a read-only filesystem backend and an Explorer UI shell. File operations (new folder, copy, move, rename, Trash) are implemented; Spotlight search of the current folder is implemented; Quick Look preview (native panel, see README) is implemented; drag-and-drop is not implemented yet; see `plan.md` and `README.md` for the documented build and check commands.
 
 ## Working In This Repository
 

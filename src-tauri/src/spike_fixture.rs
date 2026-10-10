@@ -49,6 +49,11 @@ impl Fixture {
 
     /// Writes a new file; `name` must be a single plain file name and must not exist.
     pub fn write(&self, name: &str, contents: &str) -> io::Result<PathBuf> {
+        self.write_bytes(name, contents.as_bytes())
+    }
+
+    /// Like `write`, for binary contents.
+    pub fn write_bytes(&self, name: &str, contents: &[u8]) -> io::Result<PathBuf> {
         let mut parts = Path::new(name).components();
         match (parts.next(), parts.next()) {
             (Some(Component::Normal(_)), None) => {}
@@ -65,7 +70,7 @@ impl Fixture {
             .write(true)
             .create_new(true)
             .open(&path)?
-            .write_all(contents.as_bytes())?;
+            .write_all(contents)?;
         Ok(path)
     }
 
