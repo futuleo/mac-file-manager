@@ -522,3 +522,22 @@ test('published artifact symlinks are reported stale without reading their targe
   assert.match(inspect(a).reason, /symlink/);
   assert.equal(ensure(a).status, 'built');
 });
+
+test('an extractor replacing the generation root with a symlink is detected before any external read or write', (t) => {
+  const { dir, repo, out } = workspace(t);
+  build(args(repo, out, fakeTool(dir)));
+  const before = current(out);
+  const provenance = readFileSync(join(before, 'provenance.json'), 'utf8');
+  writeFileSync(join(repo, 'a.ts'), 'export const a = 2;\n');
+  git(repo, 'commit', '-qam', 'two');
+  const external = join(dir, 'external-gen');
+  mkdirSync(join(external, 'source'), { recursive: true });
+  writeFileSync(join(external, 'source', 'a.ts'), 'export const SECRET = 1;\n');
+  const body = `g="$(dirname "$out")"; mv "$g" "$g.moved"; ln -s "${external}" "$g"`;
+  const bin = fakeTool(dir, { name: 'swap', body: `out=""; for a in "$@"; do [ "$prev" = "--out" ] && out="$a"; prev="$a"; done\n${body}` });
+  assert.throws(() => build(args(repo, out, bin)), /replaced or aliased/);
+  assert.equal(existsSync(join(external, 'provenance.json')), false);
+  assert.equal(current(out), before);
+  assert.equal(readFileSync(join(before, 'provenance.json'), 'utf8'), provenance);
+  assert.equal(inspect(args(repo, out, fakeTool(dir))).status, 'stale');
+});

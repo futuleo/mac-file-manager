@@ -108,8 +108,16 @@ export function ensureOutputDir(out, beforeCreate = () => {}) {
   }
 }
 
+// The generation root must be a real directory, not an alias (e.g. a symlink swapped in by the extractor).
+function assertGenerationRoot(gen) {
+  if (!lstatOrNull(gen)?.isDirectory() || realpathSync(gen) !== gen) {
+    throw new ContextError('generation directory was replaced or aliased during the build; previous graph kept.');
+  }
+}
+
 // Reads a regular file below base without following any symlinked component; null when absent.
 function readArtifact(base, ...parts) {
+  assertGenerationRoot(base);
   let current = base;
   for (const [index, part] of parts.entries()) {
     current = join(current, part);
@@ -447,6 +455,7 @@ function buildWith(ctx, tool) {
     const result = spawnSync(tool.path, ['extract', join(gen, 'source'), ...EXTRACT_ARGS, '--out', join(gen, 'graph')], {
       encoding: 'utf8', env: tool.env, cwd: tool.scratch, timeout: 600000,
     });
+    assertGenerationRoot(gen);
     if (result.error || result.status !== 0) {
       throw new ContextError(`graphify extraction failed (${result.error?.code ?? `exit ${result.status}`}); previous graph kept.`);
     }
@@ -469,6 +478,7 @@ function buildWith(ctx, tool) {
       ...key, builtAt: new Date().toISOString(), graphSha256: sha256(bytes),
       snapshotSha256: fingerprint(observed), tree: before.tree, excludedSymlinksOrSubmodules: before.excluded,
     };
+    assertGenerationRoot(gen);
     // Exclusive create: an extractor-supplied file or symlink is never overwritten or followed.
     writeFileSync(join(gen, 'provenance.json'), `${JSON.stringify(provenance, null, 2)}\n`, { flag: 'wx' });
     if (lstatOrNull(join(out, 'current')) && !lstatOrNull(join(out, 'current')).isSymbolicLink()) {
