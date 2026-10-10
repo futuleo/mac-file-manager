@@ -392,17 +392,34 @@ Verification and limits:
 - An accepted drop runs through the same transfer service as paste (`drag_drop_transfer`):
   progress, cancel, the conflict dialog (Skip / Keep both / Replace, no overwrite by default),
   failures and partial results are unchanged. The paths, destination and operation come from the
-  native drag, not the webview, and a drop can run once. If the tab navigated or changed between
-  hover and drop, the drop is discarded and the reason shown.
+  native drag, not the webview, and a drop can run once.
+- **Target binding**: every pointer update of a native drag gets a number, and the webview asks
+  Rust to validate the target under it (`drag_hover`, with an increasing request token). A new
+  request voids the previous verdict at once, a request overtaken by a newer one is refused and stores
+  nothing, and the drop is accepted only when the verdict is for the final pointer update. The
+  claim (`drag_drop_transfer`) must name the accepted token and the exact destination Rust
+  validated, otherwise the drop is discarded unrun. The webview also compares the tab, listing
+  (`nav`), search/folder view generation and, for the open folder, its id between hover, drop and the
+  moment the task claims the drop; any change discards it with a message.
 - Refused or unclear drops are announced and shown in the tab's error banner; nothing is silent.
 - **Verification**: Rust unit tests (state machine, masks, self/descendant targets, stale ids,
-  single use, outbound outcomes) and Vitest with mocked IPC. `cargo run --locked --example
-  drag_drop_acceptance` starts a real `NSWindow`/`WKWebView`, installs the hook, and sends the real
-  destination messages with a stand-in dragging info over a **programmatic** pasteboard of file
-  URLs; it checks events, copy/move choice, bytes copied, single use, and that non-file drags are
-  not claimed.
-- **Not verified**: real mouse gestures, Finder in both directions (including copy/move modifier
-  keys and conflicts as Finder presents them), the outbound `NSDraggingSession` itself, cross-volume
-  moves, non-UTF-8 names on disk (APFS rejects them; only unit-tested), and keyboard/screen-reader
-  access to dragging (it is pointer-only; copy/cut/paste remains the keyboard path). These remain
-  required acceptance work.
+  pending/reordered hover requests, pointer staleness, claim binding, single use, outbound outcomes)
+  and Vitest with mocked IPC (deferred and reordered hover answers, search start/replace/clear,
+  navigation and view changes before and after the drop, claim-time re-check).
+  `cargo run --locked --example drag_drop_acceptance` starts a real `NSWindow`/`WKWebView`,
+  installs the hook, and sends the real destination messages with a stand-in dragging info over a
+  **programmatic** pasteboard of file URLs. It asserts: the claim/none answers, move and copy
+  cursors from the final modifier mask, an actual same-volume **move** (bytes compared, sources
+  gone), an Option **copy** (bytes compared, sources kept), mid-drag modifier change, stale
+  verdict refusal, wrong-destination claim refusal, conflict Skip and Keep both through the shared
+  transfer service, text-only drags not claimed, and `start_drag` refusal without a pressed
+  button. This is not Finder and not a real gesture.
+- **Not verified (still required acceptance work, not waived)**: real mouse gestures, Finder in
+  both directions (including copy/move modifier keys and conflicts as Finder presents them), and the
+  outbound `NSDraggingSession` itself. Blocker in the automation environment: synthesising a pointer
+  gesture needs the Accessibility permission (`AXIsProcessTrusted()` is false here, so
+  `CGEventPost` events are dropped), and `start_drag` additionally requires the hardware
+  `NSEvent.pressedMouseButtons` state, which only a real or injected HID press sets. Also
+  unverified: cross-volume moves, non-UTF-8 names on disk (APFS rejects them; only unit-tested),
+  and keyboard/screen-reader access to dragging (pointer-only; copy/cut/paste remains the keyboard
+  path).

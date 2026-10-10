@@ -220,11 +220,13 @@ unsafe extern "C-unwind" fn dragging_updated(
     let (x, y) = location(view_of(this), info);
     with_hook(|hook| {
         hook.state.set_mask(id, mask_of(info));
+        let pointer = hook.state.moved(id);
         let operation = hook.state.operation(id);
         (hook.emit)(DragEvent::Over {
             drag_id: format!("d{id}"),
             x,
             y,
+            pointer,
             operation,
         });
         to_operation(operation)
@@ -268,7 +270,8 @@ unsafe extern "C-unwind" fn perform_drag(
     };
     let accepted = with_hook(|hook| {
         hook.state.set_mask(id, mask_of(info));
-        let mode = hook.state.accept(id);
+        let accepted = hook.state.accept(id);
+        let mode = accepted.map(|(mode, _)| mode);
         let internal = hook.state.is_internal(id);
         if mode.is_some() && internal {
             hook.state.mark_handled_here();
@@ -277,6 +280,7 @@ unsafe extern "C-unwind" fn perform_drag(
             drag_id: format!("d{id}"),
             accepted: mode.is_some(),
             operation: mode,
+            token: accepted.map(|(_, token)| token),
             count: hook.state.count(id),
             internal,
         });

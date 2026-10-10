@@ -9,9 +9,9 @@ export type DragOperation = "copy" | "move";
 /** Native drag events. `dragId` identifies one incoming drag; the dragged paths never reach the webview. */
 export type DragEvent =
   | { type: "enter"; dragId: string; count: number; internal: boolean }
-  | { type: "over"; dragId: string; x: number; y: number; operation: DragOperation | null }
+  | { type: "over"; dragId: string; x: number; y: number; pointer: number; operation: DragOperation | null }
   | { type: "leave"; dragId: string }
-  | { type: "drop"; dragId: string; accepted: boolean; operation: DragOperation | null; count: number; internal: boolean }
+  | { type: "drop"; dragId: string; accepted: boolean; operation: DragOperation | null; token: number | null; count: number; internal: boolean }
   | {
       type: "sourceEnded";
       /** `handedOffMove`/`handedOffCopy`: the receiving app was told to act; this app does not know it finished. */
@@ -21,6 +21,8 @@ export type DragEvent =
     };
 
 export interface DragHover {
+  /** Echo of the request this verdict answers. */
+  token: number;
   operation: DragOperation | null;
   reason: string | null;
 }
@@ -222,13 +224,18 @@ export interface ImplementedCommands {
    * The receiving app performs the copy or move; resolves when the drag session has started.
    */
   start_drag: { args: { ids: string[] }; result: void };
-  /** Reports the folder under an incoming drag's pointer (null: none) and what dropping there would do. */
-  drag_hover: { args: { dragId: string; destinationId: string | null }; result: DragHover };
+  /**
+   * Reports the folder under an incoming drag's pointer (null: none) and what dropping there would do.
+   * `pointer` is the `over` event the target was read at; `token` increases with every request of a drag.
+   * Sending a request voids the previous verdict; a request overtaken by a newer one rejects.
+   */
+  drag_hover: { args: { dragId: string; pointer: number; token: number; destinationId: string | null }; result: DragHover };
   /**
    * Runs an accepted incoming drop through the transfer task service (events on TASK_EVENT). The
-   * sources, destination and copy/move come from the native drag. Rejects for a stale or already used drop.
+   * sources, destination and copy/move come from the native drag; `token` and `destinationId` must name
+   * the accepted hover request and its folder. Rejects (and consumes the drop) otherwise, or when already used.
    */
-  drag_drop_transfer: { args: { taskId: string; dragId: string }; result: void };
+  drag_drop_transfer: { args: { taskId: string; dragId: string; token: number; destinationId: string }; result: void };
   /** Forgets an accepted drop that will not run. Idempotent. */
   drag_discard: { args: { dragId: string }; result: void };
 }

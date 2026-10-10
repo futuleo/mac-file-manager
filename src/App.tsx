@@ -103,18 +103,19 @@ export default function App() {
       return {
         tabId: t.id,
         nav: t.nav,
+        view: `${t.viewSerial}`,
         folderId: here && !t.search ? here.id : null,
         folderName: here?.name || "/",
       };
     },
-    onDrop: ({ dragId, operation, count, tabId, targetName }) => {
+    onDrop: ({ operation, count, tabId, targetName, run }) => {
       const kind = operation === "move" ? "move" : "copy";
       operations.start({
         kind,
         title: startTitle(kind, count, targetName || "/"),
         itemCount: count,
         originTabId: tabId,
-        run: (taskId) => call("drag_drop_transfer", { taskId, dragId }),
+        run,
       });
     },
     onProblem: (message, tabId) => {

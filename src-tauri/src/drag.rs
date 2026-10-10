@@ -83,6 +83,8 @@ pub enum DragEvent {
         drag_id: String,
         x: f64,
         y: f64,
+        /// Counts pointer updates of this drag; a hover answer is only good for the update it was asked for.
+        pointer: u64,
         operation: Option<TransferMode>,
     },
     Leave {
@@ -94,6 +96,8 @@ pub enum DragEvent {
         drag_id: String,
         accepted: bool,
         operation: Option<TransferMode>,
+        /// The `drag_hover` request whose verdict was accepted; null when refused.
+        token: Option<u64>,
         count: usize,
         internal: bool,
     },
@@ -126,6 +130,8 @@ pub enum SourceOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hover {
+    /// Echo of the request this verdict answers.
+    pub token: u64,
     /// The operation that would happen now, or none when the target is refused.
     pub operation: Option<TransferMode>,
     pub reason: Option<String>,
@@ -134,6 +140,9 @@ pub struct Hover {
 /// Validated facts about a candidate drop target.
 #[derive(Debug, Clone)]
 struct Verdict {
+    /// The pointer update and hover request this verdict was computed for.
+    pointer: u64,
+    token: u64,
     destination: PathBuf,
     same_volume: bool,
     /// Every dragged item already lives directly in the destination.
@@ -146,9 +155,13 @@ struct Incoming {
     paths: Vec<PathBuf>,
     internal: bool,
     mask: Mask,
+    /// Latest native pointer update.
+    pointer: u64,
+    /// Latest hover request; older requests are refused and cannot store a verdict.
+    token: u64,
     verdict: Option<Verdict>,
-    /// Set by an accepted drop; cleared when `take_drop` consumes it.
-    accepted: Option<TransferMode>,
+    /// Set by an accepted drop with the hover token it accepted; cleared when `take_drop` consumes it.
+    accepted: Option<(TransferMode, u64)>,
 }
 
 #[derive(Debug)]
@@ -197,10 +210,25 @@ impl DragState {
             paths,
             internal,
             mask,
+            pointer: 0,
+            token: 0,
             verdict: None,
             accepted: None,
         });
         id
+    }
+
+    /// The pointer moved or the drag was polled again. A verdict computed for an
+    /// earlier update no longer authorises a drop. Returns the new update number.
+    pub fn moved(&self, id: u64) -> u64 {
+        self.lock()
+            .incoming
+            .as_mut()
+            .filter(|d| d.id == id && d.accepted.is_none())
+            .map_or(0, |drag| {
+                drag.pointer += 1;
+                drag.pointer
+            })
     }
 
     pub fn set_mask(&self, id: u64, mask: Mask) {
@@ -230,41 +258,67 @@ impl DragState {
     }
 
     /// Sets the folder under the pointer (`None`: no valid target) and reports
-    /// what dropping there would do. A stale `id` is refused.
-    pub fn hover(&self, id: u64, destination: Option<PathBuf>) -> Result<Hover, AppError> {
+    /// what dropping there would do. `pointer` is the update the target was read
+    /// at and `token` an increasing request number: the previous verdict is void
+    /// at once, an older request is refused, and a request overtaken while it was
+    /// being validated stores nothing.
+    pub fn hover(
+        &self,
+        id: u64,
+        pointer: u64,
+        token: u64,
+        destination: Option<PathBuf>,
+    ) -> Result<Hover, AppError> {
+        let paths = self.begin_hover(id, token)?;
         // Validated outside the lock: it touches the file system.
-        let paths = {
-            let inner = self.lock();
-            let drag = inner
-                .incoming
-                .as_ref()
-                .filter(|d| d.id == id && d.accepted.is_none())
-                .ok_or_else(|| invalid("This drag is no longer active."))?;
-            drag.paths.clone()
-        };
-        let verdict = destination.map(|d| evaluate(&paths, d));
+        let checked = destination.map(|d| evaluate(&paths, d));
+        self.finish_hover(id, pointer, token, checked)
+    }
+
+    /// Voids the previous verdict and registers the request.
+    fn begin_hover(&self, id: u64, token: u64) -> Result<Vec<PathBuf>, AppError> {
         let mut inner = self.lock();
         let drag = inner
             .incoming
             .as_mut()
             .filter(|d| d.id == id && d.accepted.is_none())
             .ok_or_else(|| invalid("This drag is no longer active."))?;
-        match verdict {
-            None => {
-                drag.verdict = None;
-                Ok(Hover {
-                    operation: None,
-                    reason: None,
-                })
-            }
-            Some(Err(reason)) => {
-                drag.verdict = None;
-                Ok(Hover {
-                    operation: None,
-                    reason: Some(reason),
-                })
-            }
-            Some(Ok(verdict)) => {
+        if token <= drag.token {
+            return Err(invalid("A newer drop target replaced this one."));
+        }
+        drag.token = token;
+        drag.verdict = None;
+        Ok(drag.paths.clone())
+    }
+
+    /// Stores the result unless a newer request overtook this one meanwhile.
+    fn finish_hover(
+        &self,
+        id: u64,
+        pointer: u64,
+        token: u64,
+        checked: Option<Result<Verdict, String>>,
+    ) -> Result<Hover, AppError> {
+        let mut inner = self.lock();
+        let drag = inner
+            .incoming
+            .as_mut()
+            .filter(|d| d.id == id && d.accepted.is_none())
+            .ok_or_else(|| invalid("This drag is no longer active."))?;
+        if drag.token != token {
+            return Err(invalid("A newer drop target replaced this one."));
+        }
+        let refused = |reason| Hover {
+            token,
+            operation: None,
+            reason,
+        };
+        match checked {
+            None => Ok(refused(None)),
+            Some(Err(reason)) => Ok(refused(Some(reason))),
+            Some(Ok(mut verdict)) => {
+                verdict.pointer = pointer;
+                verdict.token = token;
                 drag.verdict = Some(verdict);
                 Ok(operation_of(drag))
             }
@@ -278,17 +332,23 @@ impl DragState {
         operation_of(drag).operation
     }
 
-    /// The drop happened. Returns the operation when it is accepted; the caller
-    /// then answers the drag session with success.
-    pub fn accept(&self, id: u64) -> Option<TransferMode> {
+    /// The drop happened. Returns the operation and the hover request it accepted
+    /// when the verdict is for the final pointer update; the caller then answers
+    /// the drag session with success. A verdict that is still being replaced or
+    /// belongs to an earlier pointer position refuses the drop.
+    pub fn accept(&self, id: u64) -> Option<(TransferMode, u64)> {
         let mut inner = self.lock();
         let drag = inner
             .incoming
             .as_mut()
             .filter(|d| d.id == id && d.accepted.is_none())?;
-        let mode = operation_of(drag).operation?;
-        drag.accepted = Some(mode);
-        Some(mode)
+        let verdict = drag.verdict.as_ref()?;
+        if verdict.pointer != drag.pointer || verdict.token != drag.token {
+            return None;
+        }
+        let accepted = (operation_of(drag).operation?, verdict.token);
+        drag.accepted = Some(accepted);
+        Some(accepted)
     }
 
     pub fn is_internal(&self, id: u64) -> bool {
@@ -298,22 +358,32 @@ impl DragState {
             .is_some_and(|d| d.id == id && d.internal)
     }
 
-    /// Consumes an accepted drop exactly once.
-    pub fn take_drop(&self, id: u64) -> Result<PendingDrop, AppError> {
+    /// Consumes an accepted drop exactly once. The claim must name the hover
+    /// request that was accepted and the destination it validated; anything else
+    /// discards the drop untouched.
+    pub fn take_drop(
+        &self,
+        id: u64,
+        token: u64,
+        destination: &Path,
+    ) -> Result<PendingDrop, AppError> {
         let mut inner = self.lock();
         let drag = inner
             .incoming
             .take_if(|d| d.id == id && d.accepted.is_some())
             .ok_or_else(|| invalid("This drop is no longer pending, so nothing was changed."))?;
-        let mode = drag.accepted.unwrap_or(TransferMode::Copy);
-        let destination = drag.verdict.map(|v| v.destination).ok_or_else(|| {
-            invalid("The drop target is no longer known, so nothing was changed.")
-        })?;
-        Ok(PendingDrop {
-            sources: drag.paths,
-            destination,
-            mode,
-        })
+        let (mode, accepted_token) = drag.accepted.unwrap_or((TransferMode::Copy, 0));
+        let verdict = drag.verdict.filter(|v| v.token == accepted_token);
+        match verdict {
+            Some(v) if accepted_token == token && v.destination == destination => Ok(PendingDrop {
+                sources: drag.paths,
+                destination: v.destination,
+                mode,
+            }),
+            _ => Err(invalid(
+                "The drop target changed before the drop started, so nothing was changed.",
+            )),
+        }
     }
 
     /// Drops a pending drop without running it (the view changed under it).
@@ -376,6 +446,7 @@ impl DragState {
 fn operation_of(drag: &Incoming) -> Hover {
     let Some(verdict) = &drag.verdict else {
         return Hover {
+            token: drag.token,
             operation: None,
             reason: None,
         };
@@ -383,12 +454,14 @@ fn operation_of(drag: &Incoming) -> Hover {
     let operation = choose_operation(drag.mask, verdict.same_volume);
     if operation.is_none() {
         return Hover {
+            token: verdict.token,
             operation: None,
             reason: Some("The drag source offers neither copy nor move.".into()),
         };
     }
     if operation == Some(TransferMode::Move) && verdict.all_inside {
         return Hover {
+            token: verdict.token,
             operation: None,
             reason: Some(
                 "The items are already in this folder. Hold Option to copy them here.".into(),
@@ -396,6 +469,7 @@ fn operation_of(drag: &Incoming) -> Hover {
         };
     }
     Hover {
+        token: verdict.token,
         operation,
         reason: None,
     }
@@ -442,6 +516,8 @@ fn evaluate(paths: &[PathBuf], destination: PathBuf) -> Result<Verdict, String> 
             .is_some_and(|p| p == canonical);
     }
     Ok(Verdict {
+        pointer: 0,
+        token: 0,
         destination,
         same_volume,
         all_inside,

@@ -22,6 +22,12 @@ const BOTH: Mask = Mask {
     moving: true,
 };
 
+/// One pointer update followed by a settled hover request.
+fn settle(state: &DragState, id: u64, token: u64, dest: Option<PathBuf>) -> Hover {
+    let pointer = state.moved(id);
+    state.hover(id, pointer, token, dest).unwrap()
+}
+
 #[test]
 fn modifier_masks_choose_operations() {
     assert_eq!(Mask::from_bits(1 | 16), BOTH);
@@ -43,22 +49,24 @@ fn hover_validates_destinations() {
     let state = DragState::default();
     let id = state.enter(vec![src.clone()], false, BOTH);
 
-    let ok = state.hover(id, Some(dst.clone())).unwrap();
+    let ok = settle(&state, id, 1, Some(dst.clone()));
     assert_eq!(ok.operation, Some(TransferMode::Move));
     assert_eq!(state.operation(id), Some(TransferMode::Move));
 
+    let mut token = 1;
     for bad in [
         src.clone(),
         src.join("child"),
         file.clone(),
         root.join("missing"),
     ] {
-        let hover = state.hover(id, Some(bad)).unwrap();
+        token += 1;
+        let hover = settle(&state, id, token, Some(bad));
         assert_eq!(hover.operation, None);
         assert!(hover.reason.is_some());
         assert_eq!(state.accept(id), None);
     }
-    let none = state.hover(id, None).unwrap();
+    let none = settle(&state, id, 10, None);
     assert_eq!(none.operation, None);
     fs::remove_dir_all(root).unwrap();
 }
@@ -71,10 +79,10 @@ fn drop_runs_once_and_stale_ids_are_refused() {
     fs::create_dir(&dst).unwrap();
     let state = DragState::default();
     let id = state.enter(vec![a.clone()], false, COPY);
-    state.hover(id, Some(dst.clone())).unwrap();
-    assert_eq!(state.accept(id), Some(TransferMode::Copy));
-    assert!(state.take_drop(id + 1).is_err());
-    let pending = state.take_drop(id).unwrap();
+    settle(&state, id, 1, Some(dst.clone()));
+    assert_eq!(state.accept(id), Some((TransferMode::Copy, 1)));
+    assert!(state.take_drop(id + 1, 1, &dst).is_err());
+    let pending = state.take_drop(id, 1, &dst).unwrap();
     assert_eq!(
         pending,
         PendingDrop {
@@ -83,14 +91,14 @@ fn drop_runs_once_and_stale_ids_are_refused() {
             mode: TransferMode::Copy
         }
     );
-    assert!(state.take_drop(id).is_err());
+    assert!(state.take_drop(id, 1, &dst).is_err());
 
     // A newer drag invalidates an older accepted one.
     let old = state.enter(vec![a.clone()], false, COPY);
-    state.hover(old, Some(dst.clone())).unwrap();
+    settle(&state, old, 1, Some(dst.clone()));
     state.accept(old);
     let _new = state.enter(vec![a], false, COPY);
-    assert!(state.take_drop(old).is_err());
+    assert!(state.take_drop(old, 1, &dst).is_err());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -120,9 +128,12 @@ fn non_utf8_paths_stay_lossless() {
     fs::create_dir(&dst).unwrap();
     let state = DragState::default();
     let id = state.enter(vec![odd.clone()], false, COPY);
-    state.hover(id, Some(dst)).unwrap();
+    settle(&state, id, 1, Some(dst.clone()));
     state.accept(id);
-    assert_eq!(state.take_drop(id).unwrap().sources, vec![odd.clone()]);
+    assert_eq!(
+        state.take_drop(id, 1, &dst).unwrap().sources,
+        vec![odd.clone()]
+    );
     let ids = [path_to_id(&odd)];
     assert_eq!(resolve_sources(&ids).unwrap(), vec![odd]);
     fs::remove_dir_all(root).unwrap();
@@ -169,4 +180,83 @@ fn resolve_sources_rejects_bad_input() {
     assert!(resolve_sources(&[]).is_err());
     assert!(resolve_sources(&["zz".to_string()]).is_err());
     assert!(resolve_sources(&[path_to_id(std::path::Path::new("/definitely/missing/x"))]).is_err());
+}
+
+fn two_folders(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let root = fixture(name);
+    let (a, b, file) = (root.join("A"), root.join("B"), root.join("f.txt"));
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    fs::write(&file, "x").unwrap();
+    (root, a, b, file)
+}
+
+#[test]
+fn a_pending_hover_voids_the_previous_target() {
+    let (root, a, b, file) = two_folders("pending");
+    let state = DragState::default();
+    let id = state.enter(vec![file], false, BOTH);
+    settle(&state, id, 1, Some(a.clone()));
+    // Pointer moves to B and B's validation is still running when the drop arrives.
+    let pointer = state.moved(id);
+    let paths = state.begin_hover(id, 2).unwrap();
+    assert_eq!(state.accept(id), None, "A's verdict must not carry over");
+    // The late answer cannot revive anything for a refused drop either.
+    let verdict = evaluate(&paths, b.clone());
+    state.finish_hover(id, pointer, 2, Some(verdict)).unwrap();
+    assert_eq!(state.accept(id), Some((TransferMode::Move, 2)));
+    assert_eq!(
+        state.take_drop(id, 2, &a).unwrap_err().category,
+        ErrorCategory::InvalidInput
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reordered_hover_completions_cannot_overwrite_the_newer_target() {
+    let (root, a, b, file) = two_folders("reorder");
+    let state = DragState::default();
+    let id = state.enter(vec![file], false, BOTH);
+    let p1 = state.moved(id);
+    let paths = state.begin_hover(id, 1).unwrap();
+    let old = evaluate(&paths, a.clone());
+    let p2 = state.moved(id);
+    state.begin_hover(id, 2).unwrap();
+    // The older request finishes after the newer one started: refused, stores nothing.
+    assert!(state.finish_hover(id, p1, 1, Some(old)).is_err());
+    assert_eq!(state.accept(id), None);
+    let fresh = evaluate(&paths, b.clone());
+    state.finish_hover(id, p2, 2, Some(fresh)).unwrap();
+    // Finishing the newer one first, then the older, also keeps the newer verdict.
+    assert!(state.begin_hover(id, 1).is_err());
+    assert_eq!(state.accept(id), Some((TransferMode::Move, 2)));
+    let pending = state.take_drop(id, 2, &b).unwrap();
+    assert_eq!(pending.destination, b);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_verdict_for_an_earlier_pointer_update_is_not_accepted() {
+    let (root, a, _b, file) = two_folders("pointer");
+    let state = DragState::default();
+    let id = state.enter(vec![file], false, BOTH);
+    settle(&state, id, 1, Some(a.clone()));
+    state.moved(id);
+    assert_eq!(state.accept(id), None);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn claims_must_match_the_accepted_token_and_destination() {
+    let (root, a, b, file) = two_folders("claim");
+    let state = DragState::default();
+    for (token, dest) in [(7, &a), (1, &b)] {
+        let id = state.enter(vec![file.clone()], false, BOTH);
+        settle(&state, id, 1, Some(a.clone()));
+        assert!(state.accept(id).is_some());
+        assert!(state.take_drop(id, token, dest).is_err());
+        // The failed claim consumed the drop: nothing can be retried with other values.
+        assert!(state.take_drop(id, 1, &a).is_err());
+    }
+    fs::remove_dir_all(root).unwrap();
 }

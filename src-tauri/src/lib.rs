@@ -448,6 +448,8 @@ async fn start_drag<R: Runtime>(
 async fn drag_hover(
     drag: State<'_, Arc<DragState>>,
     drag_id: String,
+    pointer: u64,
+    token: u64,
     destination_id: Option<String>,
 ) -> Result<drag::Hover, AppError> {
     let id = parse_drag_id(&drag_id)?;
@@ -455,7 +457,7 @@ async fn drag_hover(
         .map(|d| filesystem::resolve_id("drag and drop", &d))
         .transpose()?;
     let state = Arc::clone(&drag);
-    tauri::async_runtime::spawn_blocking(move || state.hover(id, destination))
+    tauri::async_runtime::spawn_blocking(move || state.hover(id, pointer, token, destination))
         .await
         .map_err(|_| join_error("check the drop target"))?
 }
@@ -470,8 +472,11 @@ fn drag_drop_transfer<R: Runtime>(
     drag: State<'_, Arc<DragState>>,
     task_id: String,
     drag_id: String,
+    token: u64,
+    destination_id: String,
 ) -> Result<(), AppError> {
-    let pending = drag.take_drop(parse_drag_id(&drag_id)?)?;
+    let destination = filesystem::resolve_id("drag and drop", &destination_id)?;
+    let pending = drag.take_drop(parse_drag_id(&drag_id)?, token, &destination)?;
     begin_transfer(
         window,
         &tasks,
