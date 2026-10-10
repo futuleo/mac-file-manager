@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FileEntry } from "./backend/contracts";
+import { DROP_ATTRS } from "./dragdrop/useDragDrop";
 import FileIcon from "./FileIcon";
 import { SortGlyph } from "./glyphs";
 import { COLUMN_LIMITS, type ColumnWidths } from "./explorer/preferences";
@@ -13,6 +14,9 @@ const COLUMNS: { key: SortKey; label: string }[] = [
   { key: "type", label: "Type" },
   { key: "size", label: "Size" },
 ];
+
+/** Pixels the pointer must travel with the button down before a row drag starts. */
+const DRAG_THRESHOLD = 5;
 
 /** Used when the viewport cannot be measured (it has no layout yet). */
 const FALLBACK_VIEWPORT = 600;
@@ -34,6 +38,10 @@ interface Props {
   onContextMenu(entry: FileEntry | null, x: number, y: number): void;
   onRename(): void;
   onQuickLook(): void;
+  /** The pointer moved far enough with the button down on a row: start dragging it (and the selection). */
+  onDragOut(entry: FileEntry): void;
+  /** The folder row an incoming drag is over, and whether dropping there is allowed. */
+  dropHighlight: { key: string; allowed: boolean } | null;
   /** Search results come from many folders, so each row also shows its containing folder. */
   showLocation?: boolean;
 }
@@ -49,6 +57,7 @@ function FileList(props: Props) {
   const scroller = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(props.initialScrollTop);
   const [viewport, setViewport] = useState(0);
+  const pressed = useRef<{ x: number; y: number; entry: FileEntry } | null>(null);
   const rowsRef = useRef(rows);
   rowsRef.current = rows;
 
@@ -217,6 +226,8 @@ function FileList(props: Props) {
   for (let i = range.start; i < range.end; i += 1) {
     const entry = rows[i]!;
     const selected = selection.ids.has(entry.id);
+    const folder = entry.kind === "directory";
+    const hot = folder && props.dropHighlight?.key === entry.id ? props.dropHighlight : null;
     mounted.push(
       <div
         key={entry.id}
@@ -224,7 +235,21 @@ function FileList(props: Props) {
         role="row"
         aria-rowindex={i + 2}
         aria-selected={selected}
-        className={`row${selected ? " selected" : ""}${entry.id === selection.focus ? " focused" : ""}`}
+        className={`row${selected ? " selected" : ""}${entry.id === selection.focus ? " focused" : ""}${hot ? (hot.allowed ? " drop-target" : " drop-refused") : ""}`}
+        {...(folder ? { [DROP_ATTRS.id]: entry.id, [DROP_ATTRS.name]: entry.name } : {})}
+        onMouseDown={(e) => {
+          pressed.current = e.button === 0 ? { x: e.clientX, y: e.clientY, entry } : null;
+        }}
+        onMouseMove={(e) => {
+          const start = pressed.current;
+          if (!start || (e.buttons & 1) === 0) return;
+          if (Math.hypot(e.clientX - start.x, e.clientY - start.y) < DRAG_THRESHOLD) return;
+          pressed.current = null;
+          props.onDragOut(start.entry);
+        }}
+        onMouseUp={() => {
+          pressed.current = null;
+        }}
         style={{ top: i * ROW_HEIGHT, height: ROW_HEIGHT, gridTemplateColumns: template, minWidth: width }}
         title={entry.isBrokenLink ? `${entry.path} (broken link: its target cannot be found)` : entry.path}
         onClick={(e) => clickRow(e, entry)}

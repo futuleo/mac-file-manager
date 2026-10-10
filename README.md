@@ -9,9 +9,9 @@ status bar, all wired to the real backend commands. **File operations** (new
 folder, copy, cut/paste move, rename, Move to the Trash) are implemented; see
 [File operations](#file-operations). **Spotlight search** of the current folder
 (filenames or contents) is implemented; see [Search](#search). **Quick Look** preview
-is implemented; see [Quick Look](#quick-look). Finder
-drag-and-drop, Properties and "Move to" are **not implemented**; their controls are shown
-disabled ("Not available yet").
+is implemented; see [Quick Look](#quick-look). **Drag and drop** (internal, and file URLs
+to/from Finder) is implemented; see [Drag and drop](#drag-and-drop). Properties and
+"Move to" are **not implemented**; their controls are shown disabled ("Not available yet").
 
 See [plan.md](plan.md) for product scope and implementation tasks.
 See [.github/AUTONOMY.md](.github/AUTONOMY.md) for the writer/reviewer/fix/merge
@@ -107,7 +107,7 @@ capability only allows event listen/unlisten; the CSP allows only `'self'` and
 Tauri IPC (no remote content); the app makes no network requests and has no telemetry.
 The frontend has no `fs`, `shell` or `opener` access; it can only call the app
 commands listed below. The "Native services" panel lists native class presence
-only (API available), not exercised behavior; external dragging is untested.
+only (API available), not exercised behavior.
 
 ## Explorer UI
 
@@ -232,7 +232,7 @@ contents (mode selector); Return starts, Escape or clearing the box cancels.
   "Show containing folder" (navigates to the real parent and selects the item). Copy, cut,
   rename and Move to the Trash work on the results' own ids; Paste and New folder are disabled in
   a result list because there is no single destination folder. After a file operation the search
-  is re-run; after a rename the query is run again, so Spotlight alone decides whether the new name still matches (the list briefly restarts, and a just-renamed file may take a while to be re-indexed); the folder it lives in is refreshed and the search is kept. Properties, Quick Look and dragging remain unavailable.
+  is re-run; after a rename the query is run again, so Spotlight alone decides whether the new name still matches (the list briefly restarts, and a just-renamed file may take a while to be re-indexed); the folder it lives in is refreshed and the search is kept. Properties remains unavailable.
 - **Honest limits**: Spotlight cannot say whether a folder is indexed, whether access was denied,
   or whether it finished, so the state is only *gathering* or *live*, there is no "complete", and
   "no matches" is worded as not proof of absence. Content search depends on installed
@@ -264,7 +264,7 @@ and `ns_view()`, which provide the native handles later slices need.
 | Trash | `NSFileManager.trashItemAtURL:resultingItemURL:error:` | Moved a fixture to `~/.Trash`, source gone, resulting URL returned (the spike removed its own file afterwards) |
 | System icons | `NSWorkspace.iconForFile:` | Returned an `NSImage` |
 | Quick Look | `QLPreviewPanel.sharedPreviewPanel` with a Rust-defined `QLPreviewPanelDataSource` (`define_class!`) | In a standalone AppKit process the panel became visible with the expected item URL; `makeKeyAndOrderFront` and `setDataSource` were sufficient. That spike alone did not prove Tauri integration; see [Quick Look](#quick-look) for the real window |
-| External drag source | `NSView.beginDraggingSessionWithItems:event:source:` with `NSURL` pasteboard writers on the webview's `NSView`; Tauri's built-in drag-drop only handles drops *into* the window | **Not exercised.** Bindings and `NSDraggingSession` exist, but a drag needs a live view and mouse event |
+| External drag source | `NSView.beginDraggingSessionWithItems:event:source:` with `NSURL` pasteboard writers on the webview's `NSView`; Tauri's built-in drag-drop only handles drops *into* the window | Now used by the app (see [Drag and drop](#drag-and-drop)); a real session needs a live mouse event, so it is **not** exercised by automation |
 
 Design consequences and limits:
 
@@ -286,8 +286,8 @@ Design consequences and limits:
   menu, and the real WebView-to-backend IPC round trip were **not** visually
   or interactively confirmed. Frontend tests mock `invoke`; backend command
   tests use Tauri's mock runtime (see Filesystem verification).
-- External drag-and-drop to/from Finder, cross-volume behavior, and macOS versions
-  other than 26.6.1 were not tested.
+- Real-gesture drag-and-drop to/from Finder, cross-volume drops, and macOS versions
+  other than 26.6.1 were not tested (see [Drag and drop](#drag-and-drop)).
 - The app icon is an original simple placeholder. The bundle step (`.app`/`.dmg`),
   signing and notarization were not performed.
 ## Explorer UI verification
@@ -370,3 +370,39 @@ Verification and limits:
   automation.
 - Cargo/Vitest tests use the Tauri mock runtime (no `NSWindow`) and a mocked `invoke`; they cover
   argument validation, typed errors and UI wiring only.
+
+## Drag and drop
+
+- **Out**: pressing on a row and moving 5 px starts a native `NSDraggingSession` (dragging an
+  unselected row drags only it; dragging a selected row drags the selection; 1-1000 items) whose
+  items are file `NSURL`s built from the raw path bytes. The source offers copy and move only. The
+  receiving app (Finder, ...) performs the copy or move; this app never deletes sources itself and
+  never claims the receiver finished: it only reports what was offered, and reloads the source
+  folders after a move offer. A drag that cannot start (button already released, no live mouse
+  event) is shown as an error.
+- **In**: the web view's drag-destination methods are overridden on the real view (Tauri's own
+  `dragDropEnabled` is turned off: Wry decodes paths lossily and always answers "copy"). File URLs are
+  read from the pasteboard as raw bytes; a pasteboard with anything but usable file URLs is left to
+  WebKit. The webview only reports the folder under the pointer (a folder row, a sidebar place, or
+  the open folder of a non-search tab); Rust validates it (existing writable folder, not a dragged
+  item or inside one, not where the items already are for a move) and returns the operation.
+- **Copy or move** follows the source's allowed operations (Finder rules): Option copies, Command
+  moves, and with no modifier items move within a volume and copy across volumes. Link-only
+  sources are refused.
+- An accepted drop runs through the same transfer service as paste (`drag_drop_transfer`):
+  progress, cancel, the conflict dialog (Skip / Keep both / Replace, no overwrite by default),
+  failures and partial results are unchanged. The paths, destination and operation come from the
+  native drag, not the webview, and a drop can run once. If the tab navigated or changed between
+  hover and drop, the drop is discarded and the reason shown.
+- Refused or unclear drops are announced and shown in the tab's error banner; nothing is silent.
+- **Verification**: Rust unit tests (state machine, masks, self/descendant targets, stale ids,
+  single use, outbound outcomes) and Vitest with mocked IPC. `cargo run --locked --example
+  drag_drop_acceptance` starts a real `NSWindow`/`WKWebView`, installs the hook, and sends the real
+  destination messages with a stand-in dragging info over a **programmatic** pasteboard of file
+  URLs; it checks events, copy/move choice, bytes copied, single use, and that non-file drags are
+  not claimed.
+- **Not verified**: real mouse gestures, Finder in both directions (including copy/move modifier
+  keys and conflicts as Finder presents them), the outbound `NSDraggingSession` itself, cross-volume
+  moves, non-UTF-8 names on disk (APFS rejects them; only unit-tested), and keyboard/screen-reader
+  access to dragging (it is pointer-only; copy/cut/paste remains the keyboard path). These remain
+  required acceptance work.

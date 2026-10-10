@@ -2,6 +2,28 @@
 // tests pin the JSON wire format these types describe.
 
 export const TASK_EVENT = "task-event";
+export const DRAG_EVENT = "drag-event";
+
+export type DragOperation = "copy" | "move";
+
+/** Native drag events. `dragId` identifies one incoming drag; the dragged paths never reach the webview. */
+export type DragEvent =
+  | { type: "enter"; dragId: string; count: number; internal: boolean }
+  | { type: "over"; dragId: string; x: number; y: number; operation: DragOperation | null }
+  | { type: "leave"; dragId: string }
+  | { type: "drop"; dragId: string; accepted: boolean; operation: DragOperation | null; count: number; internal: boolean }
+  | {
+      type: "sourceEnded";
+      /** `handedOffMove`/`handedOffCopy`: the receiving app was told to act; this app does not know it finished. */
+      outcome: "cancelled" | "handledHere" | "handedOffCopy" | "handedOffMove" | "unexpected";
+      count: number;
+      folders: string[];
+    };
+
+export interface DragHover {
+  operation: DragOperation | null;
+  reason: string | null;
+}
 export const SEARCH_EVENT = "search-event";
 export const DIRECTORY_EVENT = "directory-event";
 /** Native menu selections; the payload is the menu item id (a string). */
@@ -194,6 +216,21 @@ export interface ImplementedCommands {
    * the panel and rejects with the same errors as `quick_look_toggle`.
    */
   quick_look_sync: { args: { seq: number; ids: string[] }; result: boolean };
+  /**
+   * Starts a native drag of 1-1000 existing items as file URLs. Must be called from the mouse-move
+   * that starts the drag while the button is still down; rejects otherwise (nothing is dragged).
+   * The receiving app performs the copy or move; resolves when the drag session has started.
+   */
+  start_drag: { args: { ids: string[] }; result: void };
+  /** Reports the folder under an incoming drag's pointer (null: none) and what dropping there would do. */
+  drag_hover: { args: { dragId: string; destinationId: string | null }; result: DragHover };
+  /**
+   * Runs an accepted incoming drop through the transfer task service (events on TASK_EVENT). The
+   * sources, destination and copy/move come from the native drag. Rejects for a stale or already used drop.
+   */
+  drag_drop_transfer: { args: { taskId: string; dragId: string }; result: void };
+  /** Forgets an accepted drop that will not run. Idempotent. */
+  drag_discard: { args: { dragId: string }; result: void };
 }
 
 /**

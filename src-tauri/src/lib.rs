@@ -1,4 +1,5 @@
 pub mod contracts;
+pub mod drag;
 pub mod filesystem;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -28,6 +29,7 @@ use contracts::{
     AppError, ConflictDecision, DIRECTORY_EVENT, ErrorCategory, FileEntry, NativeCapabilities,
     PlatformInfo, SEARCH_EVENT, SearchEvent, SearchMode, TASK_EVENT, TaskEvent, display_name,
 };
+use drag::DragState;
 use operations::{SystemTrash, TransferMode};
 use search::Searches;
 use tasks::{HostControl, TaskGuard, Tasks};
@@ -364,6 +366,20 @@ fn spawn_task<R: Runtime>(
     Ok(())
 }
 
+/// Runs a copy or move through the shared transfer task service.
+fn begin_transfer<R: Runtime>(
+    window: WebviewWindow<R>,
+    tasks: &Arc<Tasks>,
+    task_id: String,
+    mode: TransferMode,
+    sources: Vec<std::path::PathBuf>,
+    destination: std::path::PathBuf,
+) -> Result<(), AppError> {
+    spawn_task(window, tasks, task_id, move |id, control| {
+        operations::run_transfer(id, control, &SystemTrash, mode, sources, &destination);
+    })
+}
+
 /// Copies (`move_items` false) or moves items into a folder. Progress, conflicts
 /// and the result arrive on `TASK_EVENT` tagged with `task_id`.
 #[tauri::command]
@@ -383,9 +399,94 @@ fn start_transfer<R: Runtime>(
     let operation = if move_items { "move" } else { "copy" };
     let sources = ids_to_paths(operation, &source_ids)?;
     let destination = filesystem::resolve_id(operation, &destination_id)?;
-    spawn_task(window, &tasks, task_id, move |id, control| {
-        operations::run_transfer(id, control, &SystemTrash, mode, sources, &destination);
-    })
+    begin_transfer(window, &tasks, task_id, mode, sources, destination)
+}
+
+fn parse_drag_id(id: &str) -> Result<u64, AppError> {
+    id.strip_prefix('d')
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| {
+            AppError::new(
+                ErrorCategory::InvalidInput,
+                "drag and drop",
+                None,
+                "The drag identifier is malformed.",
+            )
+        })
+}
+
+/// Starts dragging the items out of the window as file URLs. Must be called while
+/// the mouse button is still down, from the gesture that moved the pointer.
+#[tauri::command]
+async fn start_drag<R: Runtime>(
+    window: WebviewWindow<R>,
+    drag: State<'_, Arc<DragState>>,
+    ids: Vec<String>,
+) -> Result<(), AppError> {
+    let paths = tauri::async_runtime::spawn_blocking(move || drag::resolve_sources(&ids))
+        .await
+        .map_err(|_| join_error("start the drag"))??;
+    #[cfg(target_os = "macos")]
+    {
+        drag::native::begin(&window, Arc::clone(&drag), paths).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (window, drag, paths);
+        Err(AppError::new(
+            ErrorCategory::Unsupported,
+            "drag and drop",
+            None,
+            "Dragging files out is only available on macOS.",
+        ))
+    }
+}
+
+/// Reports the folder under the pointer of an incoming drag (`None`: not over a
+/// folder) and returns what dropping there would do.
+#[tauri::command]
+async fn drag_hover(
+    drag: State<'_, Arc<DragState>>,
+    drag_id: String,
+    destination_id: Option<String>,
+) -> Result<drag::Hover, AppError> {
+    let id = parse_drag_id(&drag_id)?;
+    let destination = destination_id
+        .map(|d| filesystem::resolve_id("drag and drop", &d))
+        .transpose()?;
+    let state = Arc::clone(&drag);
+    tauri::async_runtime::spawn_blocking(move || state.hover(id, destination))
+        .await
+        .map_err(|_| join_error("check the drop target"))?
+}
+
+/// Runs an accepted incoming drop through the transfer service. The dragged paths,
+/// the destination and the copy/move choice all come from the native drag, not the
+/// webview. A drop can be run once.
+#[tauri::command]
+fn drag_drop_transfer<R: Runtime>(
+    window: WebviewWindow<R>,
+    tasks: State<'_, Arc<Tasks>>,
+    drag: State<'_, Arc<DragState>>,
+    task_id: String,
+    drag_id: String,
+) -> Result<(), AppError> {
+    let pending = drag.take_drop(parse_drag_id(&drag_id)?)?;
+    begin_transfer(
+        window,
+        &tasks,
+        task_id,
+        pending.mode,
+        pending.sources,
+        pending.destination,
+    )
+}
+
+/// Forgets an accepted drop that will not be run (the view changed). Idempotent.
+#[tauri::command]
+fn drag_discard(drag: State<'_, Arc<DragState>>, drag_id: String) -> Result<(), AppError> {
+    drag.discard(parse_drag_id(&drag_id)?);
+    Ok(())
 }
 
 /// Moves items to the macOS Trash (recoverable). Never deletes permanently.
@@ -581,6 +682,7 @@ pub fn register<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
         .manage(Arc::new(DirectoryReads::default()))
         .manage(Arc::new(Tasks::default()))
         .manage(Arc::new(Searches::default()))
+        .manage(Arc::new(DragState::default()))
         .invoke_handler(tauri::generate_handler![
             get_platform_info,
             get_home_directory,
@@ -601,12 +703,27 @@ pub fn register<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             start_search,
             cancel_search,
             quick_look_toggle,
-            quick_look_sync
+            quick_look_sync,
+            start_drag,
+            drag_hover,
+            drag_drop_transfer,
+            drag_discard
         ])
 }
 
 pub fn run() {
     register(tauri::Builder::default())
+        .setup(|app| {
+            #[cfg(target_os = "macos")]
+            if let Some(window) = app.get_webview_window("main") {
+                let state = Arc::clone(&*app.state::<Arc<DragState>>());
+                if let Err(reason) = drag::native::install(&window, state) {
+                    eprintln!("File drag and drop is unavailable: {reason}");
+                }
+            }
+            let _ = app;
+            Ok(())
+        })
         .menu(menu::build)
         .on_menu_event(menu::forward)
         .on_window_event(|window, event| {
