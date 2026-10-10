@@ -44,6 +44,18 @@ Check whether a Rust toolchain is already installed before considering installat
 The initial check stopped at that failure; Cargo, Xcode tools, and macOS version
 have not yet been verified.
 
+## Design fidelity guardrails
+
+See `AGENTS.md`. Baseline is classic Windows 10 File Explorer (light theme); reference:
+the Windows 10 section of
+https://support.microsoft.com/en-us/windows/experience/fileexplorer/file-explorer-in-windows (not the Windows 11
+screenshots above it).
+Verified Windows 10 reference image (520x341, collapsed ribbon, light theme; reference only, never committed): https://support.microsoft.com/en-us/windows/media/find-your-files-pin-520-png.png . It does not show the expanded ribbon, so ribbon detail comparisons need another verified Windows 10 reference. Checklist for UI changes: light palette and flat dense chrome;
+yellow folder glyphs (never native blue system folder icons); classic ribbon, navigation
+bar, details table and sidebar hierarchy; blue only as selection/focus accent. Allowed
+adaptations: macOS titlebar/menu/paths and shortcuts, tabs, font fallbacks. Material
+departures need the user's approval; the current UI is not claimed pixel-identical.
+
 ## Proposed implementation decisions
 
 These are proposed technical decisions, not additional user requirements. Obtain

@@ -111,6 +111,11 @@ only (API available), not exercised behavior; external dragging is untested.
 
 ## Explorer UI
 
+**Design baseline:** classic Windows 10 File Explorer (light). Folders always render the
+original yellow glyph; native system icons (which are blue for folders on macOS) are used
+for files only. Reference and checklist: `AGENTS.md` ("Design fidelity guardrails") and the
+Windows 10 section of https://support.microsoft.com/en-us/windows/experience/fileexplorer/file-explorer-in-windows. Verified Windows 10 reference image (520x341, collapsed ribbon, light theme; reference only, never committed): https://support.microsoft.com/en-us/windows/media/find-your-files-pin-520-png.png . It does not show the expanded ribbon, so ribbon detail comparisons need another verified Windows 10 reference.
+
 - **Tabs** (⌘T new, ⌘W close, ⇧⌘[ / ⇧⌘] previous/next; the last tab cannot be
   closed, use ⇧⌘W to close the window). Each tab has its own folder, back/forward
   history, selection, loading and error state; a closed tab cancels its read.
