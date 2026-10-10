@@ -17,16 +17,25 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          fetch-depth: 2
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '24'
       - name: Validate automation
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          node --test scripts/merge-reviewed-pr.test.mjs
+          node --test scripts/*.test.mjs
+          node scripts/commit-privacy.mjs range "$BASE_SHA" "$HEAD_SHA"
+          if [ "$EVENT_NAME" = pull_request ]; then
+            git diff --check "$BASE_SHA" "$HEAD_SHA"
+          else
+            git diff --check HEAD^ HEAD
+          fi
           ruby -ryaml -e 'ARGV.each { |p| YAML.load_file(p) }' .github/github-app.yml .github/workflows/validate.yml
-          git diff --check HEAD^ HEAD
       - name: Validate application when scaffolded
         run: |
           if [ ! -f package.json ] && [ ! -f src-tauri/Cargo.toml ]; then

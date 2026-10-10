@@ -3,7 +3,8 @@
 ## Status and objective
 
 The user authorized configuring the full autonomous writer/reviewer/fix/merge cycle.
-No application files have been created and no application dependencies have been installed.
+The scaffold, read-only filesystem backend and Explorer UI shell are implemented.
+File operations, search, preview and drag-and-drop remain unimplemented.
 Before implementing, reread this file, including any user edits.
 
 This repository file is the source of truth for the implementation plan.
@@ -31,11 +32,9 @@ Windows 10 File Explorer while preserving correct macOS filesystem behavior and 
 
 ## Repository baseline
 
-Inspected README.md, AGENTS.md, the file listing, and git status.
-Before this plan was added, the repository contained only README.md, AGENTS.md,
-and LICENSE, and the working tree was clean.
-There is no application, dependency manifest, build workflow, test suite, or lint command.
-Do not claim that planned checks already exist.
+Historical baseline: before this plan was added, the repository contained only README.md,
+AGENTS.md, and LICENSE. It now also contains the scaffold, filesystem backend and Explorer shell;
+use the commands in README.md and `.github/AUTONOMY.md`. Do not claim checks that do not exist.
 
 Work in the session worktree, not the main checkout.
 The session branch has already been renamed; do not rename it again.

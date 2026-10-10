@@ -94,6 +94,12 @@ The gate refuses to merge unless:
 - No current changes-requested review or unresolved review thread remains.
 - GitHub reports a clean mergeable state.
 
+The gate also requires every PR commit's author and committer to be GitHub noreply
+identities and no personal email in commit messages or trailers (`scripts/commit-privacy.mjs`;
+values are never printed). It squash-merges through the GraphQL `mergePullRequest` mutation
+with `expectedHeadOid`, an explicit noreply `authorEmail` derived from the authenticated
+account, and a fixed commit body with the Copilot App noreply trailer, instead of
+PR-controlled defaults. The squash committer is GitHub's `noreply@github.com`.
 The merge API includes the expected head SHA. Strict branch protection requires
 an up-to-date branch, both checks, and applies to administrators too.
 Never use `--admin`, force pushes to `main`, or disable protection to recover.
@@ -109,11 +115,14 @@ Changes to this protocol, roles, CI, or the gate require explicit independent re
 Current bootstrap validation:
 
 ```sh
-node --test scripts/merge-reviewed-pr.test.mjs
+node --test scripts/*.test.mjs
+node scripts/commit-privacy.mjs range <base-sha> <head-sha>
 ruby -ryaml -e 'ARGV.each { |p| YAML.load_file(p) }' .github/github-app.yml .github/workflows/validate.yml
 ```
 
-The CI workflow also checks whitespace. During bootstrap it explicitly reports
+The CI workflow also audits every commit in the PR range for email privacy and checks whitespace.
+Account-level GitHub email privacy settings cannot be enforced from the repository.
+Since CI and gate run PR-controlled code, changes to them need independent review before trust. During bootstrap it explicitly reports
 that application validation is unavailable. Once scaffolding adds manifests,
 CI requires `npm run check`, `npm test`, `npm run build`, Cargo formatting/check/tests,
 and a Tauri build. The scaffold must provide those commands; partial manifests fail.

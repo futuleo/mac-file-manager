@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assertMergeable, REPOSITORY, REVIEW_CONTEXT } from './merge-reviewed-pr.mjs';
+import { assertMergeable, COPILOT_TRAILER, REPOSITORY, REVIEW_CONTEXT, squashRequest } from './merge-reviewed-pr.mjs';
 
 const head = 'a'.repeat(40);
 const base = 'b'.repeat(40);
+const personal = `person${'@'}private.test`;
+const noreply = '1+user@users.noreply.github.com';
 const fixture = () => ({
+  commits: [{ sha: 'd'.repeat(40), authorEmail: noreply, committerEmail: 'noreply@github.com',
+    message: `Change\n\n${COPILOT_TRAILER}` }],
   pr: {
+    commits: 1,
     state: 'open', draft: false, mergeable: true, mergeable_state: 'clean',
     base: { ref: 'main', repo: { full_name: REPOSITORY } },
     head: { sha: head, repo: { full_name: REPOSITORY } },
@@ -43,6 +48,11 @@ const blockers = {
   'changes requested': (data) => { data.reviews = [{ user: { login: 'reviewer' }, state: 'CHANGES_REQUESTED' }]; },
   'unresolved thread': (data) => { data.threads.nodes = [{ isResolved: false }]; },
   'uninspected threads': (data) => { data.threads.pageInfo.hasNextPage = true; },
+  'personal author email': (data) => { data.commits[0].authorEmail = personal; },
+  'personal committer email': (data) => { data.commits[0].committerEmail = personal; },
+  'personal trailer email': (data) => { data.commits[0].message += `\nCo-authored-by: P <${personal}>`; },
+  'uninspected commits': (data) => { data.commits = undefined; },
+  'incomplete commit list': (data) => { data.pr.commits = 2; },
   'unknown mergeability': (data) => { data.pr.mergeable = null; },
   'dirty mergeability': (data) => { data.pr.mergeable_state = 'dirty'; },
 };
@@ -78,4 +88,20 @@ test('a comment-only review does not clear an earlier change request', () => {
     { user: { login: 'reviewer' }, state: 'COMMENTED' },
   ];
   assert.throws(() => assertMergeable(data, head, base));
+});
+
+test('squash request pins head, uses noreply identity and a fixed body', () => {
+  const pr = { number: 7, node_id: 'PR_x', title: 'Add thing' };
+  const request = squashRequest(pr, head, noreply);
+  assert.equal(request.expectedHeadOid, head);
+  assert.equal(request.authorEmail, noreply);
+  assert.equal(request.mergeMethod, 'SQUASH');
+  assert.equal(request.commitHeadline, 'Add thing (#7)');
+  assert.ok(request.commitBody.endsWith(COPILOT_TRAILER));
+});
+
+test('squash request rejects a non-noreply identity and email-bearing titles', () => {
+  const pr = { number: 7, node_id: 'PR_x', title: `Fix by ${personal}` };
+  assert.throws(() => squashRequest(pr, head, personal));
+  assert.doesNotMatch(squashRequest(pr, head, noreply).commitHeadline, /@/);
 });
