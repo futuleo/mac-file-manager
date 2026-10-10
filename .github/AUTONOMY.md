@@ -110,6 +110,23 @@ mergeability, unavailable API, missing check, or missing attestation blocks merg
 Do not execute a PR's modified copy of the gate as trusted coordinator code.
 Changes to this protocol, roles, CI, or the gate require explicit independent review.
 
+## Graphify context protocol
+
+Graphs are optional, local-only navigation (`.github/skills/graphify/SKILL.md`), never evidence
+replacing source reads, CI, exact head/base review or native acceptance, and never required.
+Updates happen on demand at work boundaries, not via watchers or hooks. Use
+`node scripts/graphify-context.mjs ensure|status --out <absolute session-artifact dir>`:
+
+- Writer: ensure the graph only when broad navigation helps, after relevant edits. Committed
+  mode gives exact-commit provenance; `--worktree` is labelled dirty and is not head evidence.
+- Reviewer: build a separate snapshot with `--rev <exact assigned head>` using the trusted
+  (main) helper, in a fresh directory. Never reuse the writer's, a stale or main graph, and never
+  execute the candidate's helper as trusted code.
+- Handoff to a session: only the assigned task, blocker/unfinished state, exact head/base when
+  relevant, and the helper's one-line graph path/provenance with fresh/stale/missing status.
+  Do not paste the graph or repeat the conversation, and do not resume paused work.
+- Missing graphify (exit 3), failed extraction or stale graphs mean: use direct source search.
+
 ## Validation
 
 Current bootstrap validation:

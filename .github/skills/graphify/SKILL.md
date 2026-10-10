@@ -39,6 +39,30 @@ historical revision, index a `git archive` snapshot instead of switching branche
 Rebuild after relevant changes; a commit hash alone does not cover dirty edits.
 Do not rebuild merely because this skill was loaded.
 
+## Freshness helper
+
+`scripts/graphify-context.mjs` automates the steps above on demand (no watcher or hook):
+
+```sh
+node scripts/graphify-context.mjs ensure --out ABS_ARTIFACT_DIR [--rev REV | --worktree] [--task TEXT]
+node scripts/graphify-context.mjs status --out ABS_ARTIFACT_DIR [--rev REV | --worktree]
+```
+
+- `--out` must be an absolute session-artifact directory outside the worktree.
+- Default is a snapshot of a committed revision (exact-commit evidence). `--worktree`
+  snapshots uncommitted files (edits, additions, deletions), is labelled
+  `dirty-worktree-not-exact-head` and is only for a writer's own navigation.
+- `ensure` reuses the graph only if commit/source fingerprint, graphify version and
+  extraction settings still match and `graph.json` is intact; otherwise it rebuilds.
+  Source changes during a build, extraction failure or a missing/corrupt graph publish
+  nothing. `status` never builds (exit 2 when missing/stale; exit 3 when graphify is
+  not installed, so use direct source search).
+- It prints one handoff line: task, graph state, evidence label, commit, and graph and
+  provenance paths. Send that line, not graph content.
+- Reviewers: run the trusted helper from the coordinator's/main checkout against the
+  PR checkout with `--rev <exact head>` into a fresh directory. Never run the candidate
+  PR's copy of the helper or skill as trusted. Never reuse the writer's graph.
+
 ## Local commands
 
 Replace uppercase path placeholders with resolved, explicitly chosen paths.

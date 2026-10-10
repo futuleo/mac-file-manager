@@ -62,7 +62,10 @@ optional and not part of any build, test or review gate. It was tested with
 extraction (`--code-only`) with `GRAPHIFY_NO_AUTO_REFRESH=1`; no LLM, hooks or
 watchers. Write graph output to a directory outside version control (and never
 commit it). A graph is only a navigation aid for the revision it was built from,
-and there is no guarantee that it saves tokens or credits.
+and there is no guarantee that it saves tokens or credits. `scripts/graphify-context.mjs`
+(`ensure`/`status`, covered by `node --test scripts/*.test.mjs`) builds or reuses a graph only while
+its commit/source fingerprint and tool version still match; see the skill and
+`.github/AUTONOMY.md` for the writer/reviewer handoff protocol.
 
 ## Structure
 
