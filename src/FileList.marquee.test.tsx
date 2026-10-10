@@ -200,17 +200,49 @@ describe("marquee selection", () => {
     expect(selected()).toEqual(ids(7, 8, 9));
   });
 
-  it("a replaced list or unmount drops the gesture without touching selection", () => {
-    const { rerender, unmount } = mount();
+  it("a replaced list ends the rectangle but the held press still owns its release and click", () => {
+    vi.useFakeTimers();
+    const { rerender } = mount();
+    press(grid(), 300, yOf(9) + 40);
+    move(300, yOf(5));
+    expect(selected()).toEqual(ids(5, 6, 7, 8, 9));
+    const before = changes.length;
+    rerender(<Host rows={make(10)} />); // same ids, new entry objects (a live update)
+    expect(grid().querySelector(".marquee")).toBeNull();
+    act(() => {
+      vi.advanceTimersByTime(100);
+    });
+    move(300, yOf(2)); // still held: no further selection writes
+    expect(changes.length).toBe(before);
+    release();
+    fireEvent.click(grid().querySelector(".body")!);
+    expect(selected()).toEqual(ids(5, 6, 7, 8, 9));
+    act(() => {
+      vi.advanceTimersByTime(5);
+    });
+    fireEvent.click(screen.getByText("f3.txt")); // later clicks are not swallowed
+    expect(selected()).toEqual(ids(3));
+  });
+
+  it("a press that never became a drag is not swallowed when the list changes under it", () => {
+    vi.useFakeTimers();
+    const { rerender } = mount(10, selectOnly(file(1).id));
+    press(grid(), 300, yOf(9) + 40);
+    rerender(<Host rows={make(10)} />);
+    release();
+    fireEvent.click(grid());
+    expect(selected()).toEqual([]);
+  });
+
+  it("unmounting mid-gesture removes the listeners", () => {
+    vi.useFakeTimers();
+    const { unmount } = mount();
     press(grid(), 300, yOf(9) + 40);
     move(300, yOf(7));
-    expect(selected()).toEqual(ids(7, 8, 9));
     const before = changes.length;
-    rerender(<Host rows={make(10)} />);
-    move(300, yOf(1));
-    expect(changes.length).toBe(before);
-    expect(grid().querySelector(".marquee")).toBeNull();
+    const timers = vi.getTimerCount();
     unmount();
+    expect(vi.getTimerCount()).toBe(timers - 1); // the autoscroll interval
     move(300, yOf(1));
     release();
     expect(changes.length).toBe(before);
@@ -331,5 +363,13 @@ describe("marquee selection", () => {
     const before = changes.length;
     fireEvent.scroll(el, { target: { scrollTop: 240 } });
     expect(changes.length).toBe(before);
+  });
+
+  it("does not start from the bare row element (only the stretched filler cell is blank space)", () => {
+    mount();
+    press(screen.getByText("f2.txt").closest('[role="row"]')!, 380, yOf(2));
+    move(380, yOf(4));
+    release();
+    expect(changes).toEqual([]);
   });
 });

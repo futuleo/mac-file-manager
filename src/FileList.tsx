@@ -59,10 +59,12 @@ const AUTOSCROLL_TICK_MS = 16;
 
 interface MarqueeGesture {
   /**
-   * `restore` puts the pre-gesture selection back but keeps the gesture until the button is released;
-   * `commit` finalizes focus and ends it (`released`: the mouse-up that follows a drag); `drop` just ends it.
+   * `restore` puts the pre-gesture selection back and `detach` (the list changed) leaves it as is; both
+   * stop the rectangle but keep listening until the button is released so that release's click stays
+   * suppressed. `commit` finalizes focus and ends it (`released`: the mouse-up that follows a drag);
+   * `drop` just ends it (unmount).
    */
-  end(how: "commit" | "restore" | "drop", released?: boolean): void;
+  end(how: "commit" | "restore" | "detach" | "drop", released?: boolean): void;
   /** Recomputes the rectangle after the list scrolled under a stationary pointer. */
   refresh(): void;
 }
@@ -100,7 +102,7 @@ function FileList(props: Props) {
   // A gesture never outlives the list it started on (refresh, sort, new results) or the component.
   useEffect(() => () => gesture.current?.end("drop"), []);
   useEffect(() => {
-    gesture.current?.end("drop");
+    gesture.current?.end("detach");
   }, [rows]);
 
   useLayoutEffect(() => {
@@ -241,6 +243,7 @@ function FileList(props: Props) {
     let latest = base;
     let far: string | null = null;
     let cancelled = false;
+    let dragged = false;
     suppressClick.current = false;
 
     const update = () => {
@@ -249,6 +252,7 @@ function FileList(props: Props) {
       if (!active) {
         if (Math.hypot(now.x - origin.x, now.y - origin.y) < MARQUEE_THRESHOLD) return;
         active = true;
+        dragged = true;
       }
       const list = rowsRef.current;
       const band = rowsInBand(origin.y, now.y, list.length);
@@ -309,14 +313,14 @@ function FileList(props: Props) {
     const onBlur = () => end("commit");
     const timer = window.setInterval(autoscroll, AUTOSCROLL_TICK_MS);
 
-    function end(how: "commit" | "restore" | "drop", released = false) {
+    function end(how: "commit" | "restore" | "detach" | "drop", released = false) {
       if (gesture.current !== handle) return;
-      if (how === "restore") {
-        if (!active || cancelled) return;
+      if (how === "restore" || how === "detach") {
+        if (cancelled || (how === "restore" && !active)) return;
         cancelled = true;
         active = false;
         setMarquee(null);
-        onSelectRef.current(base);
+        if (how === "restore") onSelectRef.current(base);
         return;
       }
       gesture.current = null;
@@ -327,7 +331,7 @@ function FileList(props: Props) {
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("blur", onBlur);
       setMarquee(null);
-      if (released && (active || cancelled)) {
+      if (released && dragged) {
         // Only the click that this very release produces is swallowed, not later ones.
         suppressClick.current = true;
         window.setTimeout(() => {
