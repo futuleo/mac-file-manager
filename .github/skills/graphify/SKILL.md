@@ -68,6 +68,8 @@ cd ASSIGNED_CHECKOUT && node ABS_HELPER_PATH status --out ABS_ARTIFACT_DIR [--re
   modification during extraction keeps the previous generation. Missing or malformed
   `current`/provenance is reported stale and rebuilt by `ensure`. `status` never builds (exit 2 missing/stale; exit 3 graphify not
   installed, so use direct source search).
+- Published artifacts must be regular files below non-symlink directories; symlinked
+  `graph.json`/provenance/parents are reported stale and never read or overwritten.
 - graphify is executed only if it resolves outside the indexed repository, with an empty
   owned HOME/config/cache and a bounded PATH; indexed source is never executed.
 - It prints one handoff line (task, graph state, evidence label, commit, graph and

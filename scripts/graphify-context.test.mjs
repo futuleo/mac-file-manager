@@ -7,7 +7,7 @@ import {
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import test from 'node:test';
-import { build, ContextError, ensure, EXIT, graphProblem, inspect, main } from './graphify-context.mjs';
+import { build, ContextError, ensure, ensureOutputDir, EXIT, graphProblem, inspect, main } from './graphify-context.mjs';
 
 const helper = join(dirname(new URL(import.meta.url).pathname), 'graphify-context.mjs');
 const git = (cwd, ...args) => execFileSync('git', ['-c', 'commit.gpgsign=false', '-c', 'core.fsmonitor=false', ...args], {
@@ -206,10 +206,12 @@ test('overlapping builds are serialized and publish a matching graph and provena
   const toolB = fakeTool(dir, { name: 'tool-b', graph: '{"nodes":[{"id":"B"}],"links":[]}' });
   const run = (bin) => new Promise((resolveRun) => {
     const child = spawn(process.execPath, [helper, 'ensure', '--out', out], { cwd: repo, env: { ...process.env, GRAPHIFY_BIN: bin } });
-    child.on('close', resolveRun);
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (code) => resolveRun({ code, stderr }));
   });
-  const [codeA, codeB] = await Promise.all([run(slowA), run(toolB)]);
-  assert.deepEqual([codeA, codeB], [0, 0]);
+  const results = await Promise.all([run(slowA), run(toolB)]);
+  assert.deepEqual(results.map(({ code }) => code), [0, 0], results.map(({ stderr }) => stderr).join('\n'));
   const gen = current(out);
   const provenance = JSON.parse(readFileSync(join(gen, 'provenance.json'), 'utf8'));
   const graph = readFileSync(join(gen, 'graph', 'graphify-out', 'graph.json'));
@@ -439,4 +441,84 @@ test('old generations are retained, so protected old content cannot fail a later
   assert.equal(generations(out).length, 2);
   assert.notEqual(current(out), old);
   assert.equal(inspect(a).status, 'fresh');
+});
+
+test('first-use marker initialization tolerates a concurrent initializer but never a foreign marker', (t) => {
+  const { dir } = workspace(t);
+  const out = join(dir, 'fresh-out');
+  ensureOutputDir(out, () => writeFileSync(join(out, '.graphify-context'), 'other initializer\n'));
+  assert.equal(readFileSync(join(out, '.graphify-context'), 'utf8'), 'other initializer\n');
+
+  const linked = join(dir, 'linked-out');
+  const victim = join(dir, 'victim.txt');
+  writeFileSync(victim, 'keep');
+  assert.throws(() => ensureOutputDir(linked, () => symlinkSync(victim, join(linked, '.graphify-context'))), /non-regular/);
+  assert.equal(readFileSync(victim, 'utf8'), 'keep');
+});
+
+test('first concurrent ensure calls on a new output both succeed', async (t) => {
+  const { dir, repo, out } = workspace(t);
+  const bin = fakeTool(dir);
+  const run = () => new Promise((resolveRun) => {
+    const child = spawn(process.execPath, [helper, 'ensure', '--out', out], { cwd: repo, env: { ...process.env, GRAPHIFY_BIN: bin } });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (code) => resolveRun({ code, stderr }));
+  });
+  const results = await Promise.all([run(), run(), run()]);
+  assert.deepEqual(results.map(({ code }) => code), [0, 0, 0], results.map(({ stderr }) => stderr).join('\n'));
+  assert.equal(inspect(args(repo, out, bin)).status, 'fresh');
+});
+
+test('artifact symlinks created by the extractor are never followed or overwritten', (t) => {
+  const { dir, repo, out } = workspace(t);
+  build(args(repo, out, fakeTool(dir)));
+  const before = current(out);
+  const provenance = readFileSync(join(before, 'provenance.json'), 'utf8');
+  writeFileSync(join(repo, 'a.ts'), 'export const a = 2;\n');
+  git(repo, 'commit', '-qam', 'two');
+  const victim = join(dir, 'victim.txt');
+  writeFileSync(victim, 'keep');
+  const external = join(dir, 'external-graph');
+  mkdirSync(external);
+  writeFileSync(join(external, 'graph.json'), GOOD);
+  const attacks = {
+    provenance: `ln -s "${victim}" "$(dirname "$out")/provenance.json"`,
+    graphFile: `mkdir -p "$out/graphify-out"; ln -s "${join(external, 'graph.json')}" "$out/graphify-out/graph.json"; exit 0`,
+    graphParent: `ln -s "${external}" "$out/graphify-out"; exit 0`,
+  };
+  for (const [name, body] of Object.entries(attacks)) {
+    const bin = fakeTool(dir, { name: `atk-${name}`, body: `out=""; for a in "$@"; do [ "$prev" = "--out" ] && out="$a"; prev="$a"; done\n${body}` });
+    assert.throws(() => build(args(repo, out, bin)), /symlink|exists|no graph|EEXIST/, name);
+    assert.equal(readFileSync(victim, 'utf8'), 'keep');
+    assert.equal(current(out), before);
+  }
+  assert.equal(readFileSync(join(before, 'provenance.json'), 'utf8'), provenance);
+  assert.deepEqual(generations(out), [before.split('/').pop()]);
+});
+
+test('published artifact symlinks are reported stale without reading their targets', (t) => {
+  const { dir, repo, out } = workspace(t);
+  const a = args(repo, out, fakeTool(dir));
+  build(a);
+  const gen = current(out);
+  const external = join(dir, 'external');
+  mkdirSync(external);
+  const original = readFileSync(join(gen, 'graph', 'graphify-out', 'graph.json'));
+  writeFileSync(join(external, 'graph.json'), original);
+  const graphDir = join(gen, 'graph', 'graphify-out');
+  rmSync(graphDir, { recursive: true });
+  symlinkSync(external, graphDir);
+  assert.match(inspect(a).reason, /symlink/);
+  rmSync(graphDir);
+  mkdirSync(graphDir);
+  symlinkSync(join(external, 'graph.json'), join(graphDir, 'graph.json'));
+  assert.match(inspect(a).reason, /symlink/);
+  const prov = join(gen, 'provenance.json');
+  const saved = readFileSync(prov);
+  writeFileSync(join(external, 'p.json'), saved);
+  rmSync(prov);
+  symlinkSync(join(external, 'p.json'), prov);
+  assert.match(inspect(a).reason, /symlink/);
+  assert.equal(ensure(a).status, 'built');
 });

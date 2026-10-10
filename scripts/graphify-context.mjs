@@ -79,7 +79,15 @@ function checkOutput(out, root) {
   return real;
 }
 
-function ensureOutputDir(out) {
+// True when a regular marker exists; a symlink or other non-regular marker is always refused.
+function hasMarker(marker) {
+  const stat = lstatOrNull(marker);
+  if (stat && !stat.isFile()) throw new ContextError('--out has a non-regular graphify-context marker; refusing to use it.');
+  return stat !== null;
+}
+
+// `beforeCreate` is a test seam for the first-use initialization race.
+export function ensureOutputDir(out, beforeCreate = () => {}) {
   const stat = lstatOrNull(out);
   const marker = join(out, MARKER);
   if (!stat) {
@@ -87,13 +95,36 @@ function ensureOutputDir(out) {
   } else if (!stat.isDirectory()) {
     throw new ContextError('--out exists and is not a directory.');
   }
-  const markerStat = lstatOrNull(marker);
-  if (markerStat) {
-    if (!markerStat.isFile()) throw new ContextError('--out has a non-regular graphify-context marker; refusing to use it.');
-  } else if (readdirSync(out).length > 0) {
+  if (hasMarker(marker)) return;
+  if (readdirSync(out).length > 0 && !hasMarker(marker)) {
     throw new ContextError('--out is not empty and is not a graphify-context directory; refusing to use it.');
-  } else {
+  }
+  beforeCreate();
+  try {
     writeFileSync(marker, 'managed by scripts/graphify-context.mjs\n', { flag: 'wx' });
+  } catch (error) {
+    // A concurrent initializer may have created it; accept only a regular marker.
+    if (error.code !== 'EEXIST' || !hasMarker(marker)) throw error;
+  }
+}
+
+// Reads a regular file below base without following any symlinked component; null when absent.
+function readArtifact(base, ...parts) {
+  let current = base;
+  for (const [index, part] of parts.entries()) {
+    current = join(current, part);
+    const stat = lstatOrNull(current);
+    if (!stat) return null;
+    const last = index === parts.length - 1;
+    if (stat.isSymbolicLink() || (last ? !stat.isFile() : !stat.isDirectory())) {
+      throw new ContextError(`artifact ${parts.join('/')} is a symlink or not a regular file; refusing to read it.`);
+    }
+  }
+  const fd = openSync(current, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    return readFileSync(fd);
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -308,7 +339,8 @@ export function graphProblem(bytes) {
   return null;
 }
 
-const graphPath = (gen) => join(gen, 'graph', 'graphify-out', 'graph.json');
+const GRAPH_PARTS = ['graph', 'graphify-out', 'graph.json'];
+const graphPath = (gen) => join(gen, ...GRAPH_PARTS);
 
 function currentGeneration(out) {
   const link = join(out, 'current');
@@ -331,9 +363,10 @@ function inspectWith({ root, out, mode, rev }, tool) {
   if (current.corrupt) return { status: 'stale', reason: current.corrupt };
   let provenance;
   try {
-    provenance = JSON.parse(readFileSync(join(current.dir, 'provenance.json'), 'utf8'));
+    provenance = JSON.parse(readArtifact(current.dir, 'provenance.json') ?? 'null');
   } catch (error) {
-    if (!(error instanceof SyntaxError) && error.code !== 'ENOENT') throw error;
+    if (error instanceof ContextError) return { status: 'stale', reason: error.message };
+    if (!(error instanceof SyntaxError)) throw error;
     return { status: 'stale', reason: 'provenance is missing or corrupt' };
   }
   if (!wellFormed(provenance)) return { status: 'stale', reason: 'provenance is malformed' };
@@ -343,11 +376,12 @@ function inspectWith({ root, out, mode, rev }, tool) {
   if (changed.length > 0) return { status: 'stale', reason: `changed: ${changed.join(', ')}`, ...base };
   let bytes;
   try {
-    bytes = readFileSync(graphPath(current.dir));
+    bytes = readArtifact(current.dir, ...GRAPH_PARTS);
   } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    return { status: 'stale', reason: 'graph output is missing', ...base };
+    if (!(error instanceof ContextError)) throw error;
+    return { status: 'stale', reason: error.message, ...base };
   }
+  if (bytes === null) return { status: 'stale', reason: 'graph output is missing', ...base };
   const problem = sha256(bytes) !== provenance.graphSha256 ? 'graph output changed since it was built' : graphProblem(bytes);
   return problem ? { status: 'stale', reason: problem, ...base } : { status: 'fresh', ...base };
 }
@@ -416,16 +450,12 @@ function buildWith(ctx, tool) {
     if (result.error || result.status !== 0) {
       throw new ContextError(`graphify extraction failed (${result.error?.code ?? `exit ${result.status}`}); previous graph kept.`);
     }
-    let bytes;
-    try {
-      bytes = readFileSync(graphPath(gen));
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-      throw new ContextError('graphify produced no graph.json; previous graph kept.');
-    }
+    const bytes = readArtifact(gen, ...GRAPH_PARTS);
+    if (bytes === null) throw new ContextError('graphify produced no graph.json; previous graph kept.');
     const problem = graphProblem(bytes);
     if (problem) throw new ContextError(`${problem}; previous graph kept.`);
 
+    if (!lstatOrNull(join(gen, 'source'))?.isDirectory()) throw new ContextError('snapshot changed during extraction; previous graph kept.');
     // Observe the generation's actual source after extraction, not the pre-extraction claim.
     const observed = new Map(listFiles(join(gen, 'source')).map((name) => [name, readFileSync(join(gen, 'source', name))]));
     if (fingerprint(observed) !== fingerprint(before.entries)) {
@@ -439,7 +469,8 @@ function buildWith(ctx, tool) {
       ...key, builtAt: new Date().toISOString(), graphSha256: sha256(bytes),
       snapshotSha256: fingerprint(observed), tree: before.tree, excludedSymlinksOrSubmodules: before.excluded,
     };
-    writeFileSync(join(gen, 'provenance.json'), `${JSON.stringify(provenance, null, 2)}\n`);
+    // Exclusive create: an extractor-supplied file or symlink is never overwritten or followed.
+    writeFileSync(join(gen, 'provenance.json'), `${JSON.stringify(provenance, null, 2)}\n`, { flag: 'wx' });
     if (lstatOrNull(join(out, 'current')) && !lstatOrNull(join(out, 'current')).isSymbolicLink()) {
       throw new ContextError('`current` is not a symlink; refusing to replace it.');
     }
