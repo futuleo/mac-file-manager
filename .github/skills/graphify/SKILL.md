@@ -41,27 +41,37 @@ Do not rebuild merely because this skill was loaded.
 
 ## Freshness helper
 
-`scripts/graphify-context.mjs` automates the steps above on demand (no watcher or hook):
+`scripts/graphify-context.mjs` automates the steps above on demand (no watcher or hook).
+It indexes the repository of its **current working directory**, so run it from the checkout
+to index, and invoke the helper by absolute path:
 
 ```sh
-node scripts/graphify-context.mjs ensure --out ABS_ARTIFACT_DIR [--rev REV | --worktree] [--task TEXT]
-node scripts/graphify-context.mjs status --out ABS_ARTIFACT_DIR [--rev REV | --worktree]
+cd ASSIGNED_CHECKOUT && node ABS_HELPER_PATH ensure --out ABS_ARTIFACT_DIR [--rev REV | --worktree] [--task TEXT]
+cd ASSIGNED_CHECKOUT && node ABS_HELPER_PATH status --out ABS_ARTIFACT_DIR [--rev REV | --worktree]
 ```
 
-- `--out` must be an absolute session-artifact directory outside the worktree.
-- Default is a snapshot of a committed revision (exact-commit evidence). `--worktree`
-  snapshots uncommitted files (edits, additions, deletions), is labelled
+- `--out` is an absolute directory outside the worktree (symlinks resolved; it may not
+  contain the repository). It must be new, empty, or previously created by the helper; only
+  `gen-*`, `current` and `.lock` inside it are ever replaced.
+- Default is a snapshot of the committed `REV` built from exact Git tree blobs (ignoring
+  `export-ignore`), verified against the tree; symlinks and submodules are excluded and
+  counted in provenance. `--worktree` snapshots files from disk (edits, additions,
+  deletions), rejects symlinked parent directories, is labelled
   `dirty-worktree-not-exact-head` and is only for a writer's own navigation.
-- `ensure` reuses the graph only if commit/source fingerprint, graphify version and
-  extraction settings still match and `graph.json` is intact; otherwise it rebuilds.
-  Source changes during a build, extraction failure or a missing/corrupt graph publish
-  nothing. `status` never builds (exit 2 when missing/stale; exit 3 when graphify is
-  not installed, so use direct source search).
-- It prints one handoff line: task, graph state, evidence label, commit, and graph and
-  provenance paths. Send that line, not graph content.
-- Reviewers: run the trusted helper from the coordinator's/main checkout against the
-  PR checkout with `--rev <exact head>` into a fresh directory. Never run the candidate
-  PR's copy of the helper or skill as trusted. Never reuse the writer's graph.
+- `ensure` reuses the graph only while commit/tree (or worktree fingerprint), graphify
+  version, executable/package bytes and extraction settings match and `graph.json` is
+  structurally valid; otherwise it rebuilds. Each build is staged in its own generation and
+  published atomically under a lock; any failure or mid-build source change keeps the
+  previous generation. `status` never builds (exit 2 missing/stale; exit 3 graphify not
+  installed, so use direct source search).
+- graphify is executed only if it resolves outside the indexed repository, with an empty
+  owned HOME/config/cache and a bounded PATH; indexed source is never executed.
+- It prints one handoff line (task, graph state, evidence label, commit, graph and
+  provenance paths). Graph fields supplement, and never replace, the mandatory PR URL,
+  exact SHAs, checks and native-acceptance limitations in a report.
+- Reviewers: `cd` into the assigned PR worktree and run the trusted helper by absolute
+  path (the main/coordinator checkout's copy, never the PR's) with `--rev <exact head>` and
+  a fresh `--out`. Do not reuse the writer's graph.
 
 ## Local commands
 

@@ -1,17 +1,21 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
-  copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync,
-  realpathSync, rmSync, unlinkSync, writeFileSync,
+  accessSync, closeSync, constants, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync,
+  readSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 // Optional, on-demand, local-only graph freshness helper. A graph is navigation, never evidence.
+// Each build is staged in its own generation directory; `current` is switched atomically under a lock.
 const MARKER = '.graphify-context';
-const PROVENANCE = 'provenance.json';
 const EXTRACT_ARGS = ['--code-only', '--max-workers', '2'];
-const SCHEMA = 1;
+const SCHEMA = 2;
+const GEN = /^gen-[0-9a-f]{16}$/;
+const LOCK_WAIT_MS = 100;
+const LOCK_TRIES = 1200;
 export const EXIT = { ok: 0, failure: 1, stale: 2, missingTool: 3 };
 
 export class ContextError extends Error {
@@ -22,227 +26,481 @@ export class ContextError extends Error {
 }
 
 const sha256 = (data) => createHash('sha256').update(data).digest('hex');
-const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 1 << 28 }).trim();
+const within = (parent, child) => child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
 
-function toolEnv() {
-  // No provider credentials or settings: only what a local process needs to run.
-  const env = { GRAPHIFY_NO_AUTO_REFRESH: '1' };
-  for (const key of ['PATH', 'HOME', 'LANG', 'TMPDIR']) if (process.env[key]) env[key] = process.env[key];
-  return env;
+function lstatOrNull(path) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
-function findTool(bin) {
-  const candidates = bin.includes(sep) ? [bin]
-    : (process.env.PATH ?? '').split(':').filter(Boolean).map((dir) => join(dir, bin));
-  const found = candidates.find((path) => existsSync(path));
-  if (!found) {
-    throw new ContextError(`graphify is not installed (optional); use direct source search instead of a graph.`,
-      EXIT.missingTool);
+function gitRaw(cwd, args, input) {
+  return execFileSync('git', ['-c', 'core.fsmonitor=false', ...args], {
+    cwd, input, maxBuffer: 1 << 30, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+  });
+}
+const git = (cwd, args) => gitRaw(cwd, args).toString('utf8').trim();
+// Path lists are NUL-delimited and must never be trimmed or re-encoded.
+const nulList = (buffer) => buffer.toString('latin1').split('\0').filter((item) => item.length > 0)
+  .map((item) => Buffer.from(item, 'latin1').toString('utf8'));
+
+function assertSafeRel(path) {
+  const parts = path.split('/');
+  if (path.includes('\uFFFD') || parts.some((part) => part === '' || part === '.' || part === '..')) {
+    throw new ContextError('repository contains a path that cannot be indexed safely (non-UTF-8 or traversal).');
   }
-  const path = realpathSync(found);
-  const result = spawnSync(path, ['--version'], { encoding: 'utf8', env: toolEnv() });
-  if (result.status !== 0) throw new ContextError('graphify --version failed; treat the graph as unavailable.');
-  return { path, version: result.stdout.trim(), identity: sha256(path).slice(0, 16) };
 }
 
 function repoRoot(cwd) {
   return realpathSync(git(cwd, ['rev-parse', '--show-toplevel']));
 }
 
-function assertOutside(out, root) {
-  const rel = relative(root, out);
-  if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) {
-    throw new ContextError('--out must be outside the repository worktree (use a session artifact directory).');
+// Canonicalize through the deepest existing ancestor so symlinks and `..` cannot alias the worktree.
+function canonical(path) {
+  const parts = [];
+  let current = resolve(path);
+  while (!lstatOrNull(current)) {
+    parts.unshift(basename(current));
+    current = dirname(current);
   }
+  return join(realpathSync(current), ...parts);
 }
 
-// Fingerprint regular files only (symlinks are never followed or indexed).
-function fingerprintFiles(base, files) {
+function checkOutput(out, root) {
+  const real = canonical(out);
+  if (within(root, real) || within(real, root)) {
+    throw new ContextError('--out must be outside the repository and must not contain it (after resolving symlinks).');
+  }
+  return real;
+}
+
+function ensureOutputDir(out) {
+  const stat = lstatOrNull(out);
+  if (!stat) {
+    mkdirSync(out, { recursive: true });
+  } else if (!stat.isDirectory()) {
+    throw new ContextError('--out exists and is not a directory.');
+  } else if (readdirSync(out).length > 0 && !lstatOrNull(join(out, MARKER))) {
+    throw new ContextError('--out is not empty and is not a graphify-context directory; refusing to use it.');
+  }
+  writeFileSync(join(out, MARKER), 'managed by scripts/graphify-context.mjs\n');
+}
+
+function listFiles(dir, prefix = '') {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const name = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isSymbolicLink()) throw new ContextError('unexpected symlink in snapshot.');
+    return entry.isDirectory() ? listFiles(join(dir, entry.name), name) : [name];
+  });
+}
+
+function fingerprint(entries) {
   const hash = createHash('sha256');
-  for (const file of [...files].sort()) {
-    const full = join(base, file);
-    const stat = lstatSync(full);
-    if (!stat.isFile()) continue;
-    hash.update(`${file}\0${sha256(readFileSync(full))}\n`);
+  for (const path of [...entries.keys()].sort()) hash.update(`${path}\0${sha256(entries.get(path))}\n`);
+  return hash.digest('hex');
+}
+
+function hashTree(dir) {
+  const hash = createHash('sha256');
+  for (const name of listFiles(dir).sort()) {
+    if (name.split('/').includes('__pycache__')) continue;
+    hash.update(`${name}\0${sha256(readFileSync(join(dir, name)))}\n`);
   }
   return hash.digest('hex');
 }
 
-function worktreeFiles(root) {
-  const listed = git(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard'])
-    .split('\0').filter(Boolean);
-  // Deleted tracked files are listed but absent; they are simply not part of the source.
-  return listed.filter((file) => {
+// ---- trusted tool -------------------------------------------------------------------------
+
+function findExecutable(bin, pathEnv) {
+  const candidates = bin.includes(sep) ? [bin]
+    : (pathEnv ?? '').split(':').filter((dir) => isAbsolute(dir)).map((dir) => join(dir, bin));
+  for (const path of candidates) {
     try {
-      return lstatSync(join(root, file)).isFile();
+      accessSync(path, constants.X_OK);
+      return realpathSync(path);
     } catch (error) {
-      if (error.code === 'ENOENT') return false;
-      throw error;
+      if (!['ENOENT', 'EACCES', 'ENOTDIR'].includes(error.code)) throw error;
     }
-  });
-}
-
-function sourceState(root, mode, rev) {
-  const head = git(root, ['rev-parse', '--verify', `${rev}^{commit}`]);
-  const dirty = git(root, ['status', '--porcelain=v1', '--untracked-files=all']).length > 0;
-  if (mode === 'worktree') {
-    return { commit: head, dirty, fingerprint: fingerprintFiles(root, worktreeFiles(root)) };
   }
-  return { commit: head, dirty, fingerprint: head };
+  throw new ContextError('graphify is not installed (optional); use direct source search instead of a graph.',
+    EXIT.missingTool);
 }
 
-function expectedKey(root, mode, rev, tool) {
-  const state = sourceState(root, mode, rev);
+function packageIdentity(path) {
+  const hash = createHash('sha256').update(readFileSync(path));
+  const lib = join(dirname(dirname(path)), 'lib');
+  let kind = 'executable-only';
+  if (lstatOrNull(lib)) {
+    for (const entry of readdirSync(lib).filter((name) => name.startsWith('python')).sort()) {
+      const pkg = join(lib, entry, 'site-packages', 'graphify');
+      if (lstatOrNull(pkg)?.isDirectory()) {
+        hash.update(hashTree(pkg));
+        kind = 'package';
+      }
+    }
+  }
+  return { identity: hash.digest('hex'), kind };
+}
+
+// Runs fn with a trusted extractor and an owned, empty HOME/settings/cache; never the user's.
+function withTool({ bin, pathEnv, root }, fn) {
+  const path = findExecutable(bin, pathEnv);
+  if (within(root, path)) {
+    throw new ContextError('graphify resolves inside the repository being indexed; refusing to execute it.');
+  }
+  const scratch = mkdtempSync(join(tmpdir(), 'graphify-context-'));
+  try {
+    const dirs = ['home', 'config', 'cache', 'tmp'].map((name) => join(scratch, name));
+    dirs.forEach((dir) => mkdirSync(dir));
+    const [home, config, cache, tmp] = dirs;
+    const env = {
+      PATH: `${dirname(path)}:/usr/bin:/bin`, HOME: home, XDG_CONFIG_HOME: config, XDG_CACHE_HOME: cache,
+      TMPDIR: tmp, GRAPHIFY_NO_AUTO_REFRESH: '1', PYTHONDONTWRITEBYTECODE: '1',
+    };
+    const version = spawnSync(path, ['--version'], { encoding: 'utf8', env, cwd: scratch, timeout: 30000 });
+    if (version.status !== 0) throw new ContextError('graphify --version failed; treat the graph as unavailable.');
+    const { identity, kind } = packageIdentity(path);
+    return fn({ path, version: version.stdout.trim(), identity, kind, env, scratch });
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+// ---- source collection --------------------------------------------------------------------
+
+function committedKey(root, rev) {
+  if (rev.startsWith('-')) throw new ContextError('--rev must be a revision, not an option.');
+  const commit = git(root, ['rev-parse', '--verify', `${rev}^{commit}`]);
+  return { commit, tree: git(root, ['rev-parse', '--verify', `${commit}^{tree}`]) };
+}
+
+// Exact Git tree bytes (no archive attributes); symlinks and submodules are excluded, and counted.
+function collectCommitted(root, { commit, tree }) {
+  const records = gitRaw(root, ['ls-tree', '-r', '-z', '--full-tree', commit]).toString('latin1').split('\0')
+    .filter(Boolean);
+  const blobs = [];
+  let excluded = 0;
+  for (const record of records) {
+    const tab = record.indexOf('\t');
+    const [mode, type, oid] = record.slice(0, tab).split(' ');
+    if (mode === '120000' || type === 'commit') excluded += 1;
+    else blobs.push({ oid, path: Buffer.from(record.slice(tab + 1), 'latin1').toString('utf8') });
+  }
+  const algo = blobs[0]?.oid.length === 64 ? 'sha256' : 'sha1';
+  const out = gitRaw(root, ['cat-file', '--batch'], blobs.map(({ oid }) => `${oid}\n`).join(''));
+  const entries = new Map();
+  let offset = 0;
+  for (const { oid, path } of blobs) {
+    const eol = out.indexOf('\n', offset);
+    const [, , size] = out.subarray(offset, eol).toString('latin1').split(' ');
+    const data = out.subarray(eol + 1, eol + 1 + Number(size));
+    offset = eol + 1 + Number(size) + 1;
+    const actual = createHash(algo).update(`blob ${data.length}\0`).update(data).digest('hex');
+    if (actual !== oid) throw new ContextError('snapshot content does not match the Git tree; nothing was published.');
+    assertSafeRel(path);
+    entries.set(path, data);
+  }
+  return { entries, excluded, source: tree };
+}
+
+function readRegular(root, file) {
+  assertSafeRel(file);
+  const full = join(root, file);
+  const stat = lstatOrNull(full);
+  if (!stat || stat.isDirectory()) return { skip: false };
+  if (stat.isSymbolicLink()) return { skip: true };
+  if (!stat.isFile()) return { skip: false };
+  const verify = () => {
+    if (realpathSync(full) !== full) throw new ContextError(`indexed path ${file} traverses a symlink; refusing to read outside the worktree.`);
+  };
+  verify();
+  const fd = openSync(full, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const data = Buffer.alloc(stat.size);
+    let read = 0;
+    while (read < stat.size) {
+      const n = readSync(fd, data, read, stat.size - read, read);
+      if (n === 0) break;
+      read += n;
+    }
+    verify();
+    return { data: data.subarray(0, read) };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function collectWorktree(root) {
+  const files = new Set(nulList(gitRaw(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard'])));
+  const entries = new Map();
+  let excluded = 0;
+  for (const file of files) {
+    const result = readRegular(root, file);
+    if (result.data) entries.set(file, result.data);
+    else if (result.skip) excluded += 1;
+  }
+  return { entries, excluded, source: fingerprint(entries) };
+}
+
+function collect(root, mode, rev) {
+  if (mode === 'worktree') {
+    const head = committedKey(root, 'HEAD');
+    return { ...head, ...collectWorktree(root) };
+  }
+  const key = committedKey(root, rev);
+  return { ...key, ...collectCommitted(root, key) };
+}
+
+// ---- freshness ----------------------------------------------------------------------------
+
+function keyFor(root, mode, source, tool) {
   return {
-    schema: SCHEMA,
-    mode,
+    schema: SCHEMA, mode,
     evidence: mode === 'worktree' ? 'dirty-worktree-not-exact-head' : 'committed-snapshot',
-    repoRoot: root,
-    commit: state.commit,
-    sourceFingerprint: state.fingerprint,
-    worktreeDirtyAtCheck: state.dirty,
-    tool: { version: tool.version, identity: tool.identity },
+    repoRoot: root, commit: source.commit, source: source.source,
+    tool: { version: tool.version, identity: tool.identity, kind: tool.kind },
     extractArgs: EXTRACT_ARGS,
   };
 }
 
-const KEY_FIELDS = ['schema', 'mode', 'evidence', 'repoRoot', 'commit', 'sourceFingerprint', 'tool', 'extractArgs'];
+function lightSource(root, mode, rev) {
+  if (mode === 'worktree') return { ...committedKey(root, 'HEAD'), source: fingerprint(collectWorktree(root).entries) };
+  const key = committedKey(root, rev);
+  return { ...key, source: key.tree };
+}
 
-function graphProblem(out, provenance) {
-  const graph = join(out, 'graph', 'graphify-out', 'graph.json');
-  if (!existsSync(graph)) return 'graph output is missing';
-  const bytes = readFileSync(graph);
-  if (sha256(bytes) !== provenance.graphSha256) return 'graph output changed since it was built';
-  let parsed;
+const KEY_FIELDS = ['schema', 'mode', 'evidence', 'repoRoot', 'commit', 'source', 'tool', 'extractArgs'];
+
+// Graphify node-link format: unique string node ids; links reference existing ids.
+export function graphProblem(bytes, expectedSha) {
+  if (expectedSha !== undefined && sha256(bytes) !== expectedSha) return 'graph output changed since it was built';
+  let graph;
   try {
-    parsed = JSON.parse(bytes.toString('utf8'));
+    graph = JSON.parse(bytes.toString('utf8'));
   } catch {
     return 'graph output is not valid JSON';
   }
-  if (!Array.isArray(parsed.nodes) || parsed.nodes.length === 0) return 'graph output has no nodes';
+  if (graph === null || typeof graph !== 'object' || Array.isArray(graph)) return 'graph output is not an object';
+  const links = graph.links ?? graph.edges;
+  if (!Array.isArray(graph.nodes) || graph.nodes.length === 0) return 'graph output has no nodes array';
+  if (!Array.isArray(links)) return 'graph output has no links array';
+  const ids = new Set();
+  for (const node of graph.nodes) {
+    if (node === null || typeof node !== 'object' || typeof node.id !== 'string' || node.id === '') return 'graph has an invalid node';
+    if (ids.has(node.id)) return 'graph has duplicate node ids';
+    ids.add(node.id);
+  }
+  for (const link of links) {
+    if (link === null || typeof link !== 'object' || !ids.has(link.source) || !ids.has(link.target)) {
+      return 'graph has a link with a missing endpoint';
+    }
+  }
   return null;
 }
 
-export function inspect({ cwd, out, mode, rev, bin }) {
-  const root = repoRoot(cwd);
-  assertOutside(out, root);
-  const tool = findTool(bin);
-  const path = join(out, PROVENANCE);
-  if (!existsSync(path)) return { status: 'missing', reason: 'no provenance for this output', root };
+const graphPath = (gen) => join(gen, 'graph', 'graphify-out', 'graph.json');
+
+function currentGeneration(out) {
+  const link = join(out, 'current');
+  if (!lstatOrNull(link)) return null;
+  const target = realpathSync(link);
+  if (dirname(target) !== out || !GEN.test(basename(target))) return { corrupt: true };
+  return { dir: target };
+}
+
+function inspectWith({ root, out, mode, rev }, tool) {
+  const current = currentGeneration(out);
+  if (!current) return { status: 'missing', reason: 'no published graph for this output' };
+  if (current.corrupt) return { status: 'stale', reason: 'current generation is invalid' };
   let provenance;
   try {
-    provenance = JSON.parse(readFileSync(path, 'utf8'));
+    provenance = JSON.parse(readFileSync(join(current.dir, 'provenance.json'), 'utf8'));
   } catch {
-    return { status: 'stale', reason: 'provenance is corrupt', root };
+    return { status: 'stale', reason: 'provenance is missing or corrupt' };
   }
-  const want = expectedKey(root, mode, rev, tool);
-  const stale = KEY_FIELDS.filter((field) => JSON.stringify(provenance[field]) !== JSON.stringify(want[field]));
-  if (stale.length > 0) return { status: 'stale', reason: `changed: ${stale.join(', ')}`, root, provenance, want };
-  const problem = graphProblem(out, provenance);
-  if (problem) return { status: 'stale', reason: problem, root, provenance, want };
-  return { status: 'fresh', root, provenance, want };
+  const want = keyFor(root, mode, lightSource(root, mode, rev), tool);
+  const changed = KEY_FIELDS.filter((field) => JSON.stringify(provenance[field]) !== JSON.stringify(want[field]));
+  const base = { provenance, want, gen: current.dir };
+  if (changed.length > 0) return { status: 'stale', reason: `changed: ${changed.join(', ')}`, ...base };
+  let bytes;
+  try {
+    bytes = readFileSync(graphPath(current.dir));
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    return { status: 'stale', reason: 'graph output is missing', ...base };
+  }
+  const problem = graphProblem(bytes, provenance.graphSha256);
+  return problem ? { status: 'stale', reason: problem, ...base } : { status: 'fresh', ...base };
 }
 
-function removeSymlinks(dir) {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const full = join(dir, entry.name);
-    if (entry.isSymbolicLink()) unlinkSync(full);
-    else if (entry.isDirectory()) removeSymlinks(full);
-  }
-}
-
-function snapshot(root, out, mode, commit) {
-  const target = join(out, 'source');
-  mkdirSync(target, { recursive: true });
-  if (mode === 'committed') {
-    const tar = execFileSync('git', ['archive', '--format=tar', commit], { cwd: root, maxBuffer: 1 << 30 });
-    execFileSync('tar', ['-x', '-C', target], { input: tar });
-    removeSymlinks(target);
-    return fingerprintFiles(target, listTree(target));
-  }
-  const files = worktreeFiles(root);
-  for (const file of files) {
-    const dest = join(target, file);
-    mkdirSync(dirname(dest), { recursive: true });
-    copyFileSync(join(root, file), dest);
-  }
-  return fingerprintFiles(target, files);
-}
-
-function listTree(dir, prefix = '') {
-  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-    const name = prefix ? `${prefix}/${entry.name}` : entry.name;
-    return entry.isDirectory() ? listTree(join(dir, entry.name), name) : [name];
-  });
-}
-
-function prepareOutput(out) {
-  if (existsSync(out)) {
-    const entries = readdirSync(out);
-    if (entries.length > 0 && !entries.includes(MARKER)) {
-      throw new ContextError('--out exists, is not empty and is not a graphify-context directory; refusing to overwrite.');
-    }
-    for (const entry of entries) rmSync(join(out, entry), { recursive: true, force: true });
-  }
-  mkdirSync(out, { recursive: true });
-  writeFileSync(join(out, MARKER), 'managed by scripts/graphify-context.mjs\n');
-}
-
-export function build({ cwd, out, mode, rev, bin }) {
+function prepare({ cwd, out, bin, pathEnv }) {
   const root = repoRoot(cwd);
-  assertOutside(out, root);
-  const tool = findTool(bin);
-  const before = expectedKey(root, mode, rev, tool);
-  prepareOutput(out);
-
-  const copied = snapshot(root, out, mode, before.commit);
-  const after = expectedKey(root, mode, rev, tool);
-  if (after.sourceFingerprint !== before.sourceFingerprint || (mode === 'worktree' && copied !== before.sourceFingerprint)) {
-    throw new ContextError('source changed while the snapshot was taken; nothing was published. Retry at a quiet moment.');
-  }
-
-  const result = spawnSync(tool.path, ['extract', join(out, 'source'), ...EXTRACT_ARGS, '--out', join(out, 'graph')], {
-    encoding: 'utf8', env: toolEnv(), cwd: out,
-  });
-  if (result.status !== 0) {
-    throw new ContextError(`graphify extraction failed (exit ${result.status}); no graph was published.`);
-  }
-  const written = sourceFingerprintOf(join(out, 'source'));
-  if (written !== copied) throw new ContextError('snapshot changed during extraction; no graph was published.');
-
-  const final = expectedKey(root, mode, rev, tool);
-  if (final.sourceFingerprint !== before.sourceFingerprint) {
-    throw new ContextError('source changed during the build; no graph was published. Rebuild when work is quiet.');
-  }
-
-  const graphPath = join(out, 'graph', 'graphify-out', 'graph.json');
-  if (!existsSync(graphPath)) throw new ContextError('graphify produced no graph.json; no graph was published.');
-  const bytes = readFileSync(graphPath);
-  const provenance = { ...final, builtAt: new Date().toISOString(), graphSha256: sha256(bytes) };
-  const problem = graphProblem(out, provenance);
-  if (problem) throw new ContextError(`${problem}; no graph was published.`);
-  writeFileSync(join(out, PROVENANCE), `${JSON.stringify(provenance, null, 2)}\n`);
-  return { status: 'built', root, provenance, want: final };
+  return { root, out: checkOutput(out, root), bin, pathEnv };
 }
 
-function sourceFingerprintOf(dir) {
-  return fingerprintFiles(dir, listTree(dir));
+export function inspect(args) {
+  const ctx = { ...prepare(args), mode: args.mode, rev: args.rev };
+  return withTool(ctx, (tool) => inspectWith(ctx, tool));
 }
 
-export function handoffLine({ status, reason, provenance, want }, out, task) {
+// ---- build --------------------------------------------------------------------------------
+
+function holderDead(lock) {
+  let pid;
+  try {
+    pid = Number(readFileSync(join(lock, 'pid'), 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    if (error.code === 'ESRCH') return true;
+    if (error.code === 'EPERM') return false;
+    throw error;
+  }
+}
+
+function withLock(out, fn) {
+  const lock = join(out, '.lock');
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      mkdirSync(lock);
+      writeFileSync(join(lock, 'pid'), String(process.pid));
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      if (holderDead(lock)) {
+        try {
+          renameSync(lock, `${lock}.dead-${randomBytes(4).toString('hex')}`);
+        } catch (renameError) {
+          if (renameError.code !== 'ENOENT') throw renameError;
+        }
+        continue;
+      }
+      if (attempt >= LOCK_TRIES) throw new ContextError('another graphify-context build holds this output; try again later.');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_WAIT_MS);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    rmSync(lock, { recursive: true, force: true });
+  }
+}
+
+function writeSnapshot(dir, entries) {
+  for (const [path, data] of entries) {
+    const dest = join(dir, path);
+    mkdirSync(dirname(dest), { recursive: true });
+    writeFileSync(dest, data, { flag: 'wx' });
+  }
+  const written = new Map(listFiles(dir).map((name) => [name, readFileSync(join(dir, name))]));
+  if (fingerprint(written) !== fingerprint(entries)) {
+    throw new ContextError('snapshot on disk differs from the collected source; nothing was published.');
+  }
+}
+
+function buildWith(ctx, tool) {
+  const { root, out, mode, rev } = ctx;
+  const before = collect(root, mode, rev);
+  const key = keyFor(root, mode, before, tool);
+  const name = `gen-${randomBytes(8).toString('hex')}`;
+  const gen = join(out, name);
+  let published = false;
+  mkdirSync(gen);
+  try {
+    writeSnapshot(join(gen, 'source'), before.entries);
+    const result = spawnSync(tool.path, ['extract', join(gen, 'source'), ...EXTRACT_ARGS, '--out', join(gen, 'graph')], {
+      encoding: 'utf8', env: tool.env, cwd: tool.scratch, timeout: 600000,
+    });
+    if (result.error || result.status !== 0) {
+      throw new ContextError(`graphify extraction failed (${result.error?.code ?? `exit ${result.status}`}); previous graph kept.`);
+    }
+    let bytes;
+    try {
+      bytes = readFileSync(graphPath(gen));
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      throw new ContextError('graphify produced no graph.json; previous graph kept.');
+    }
+    const problem = graphProblem(bytes);
+    if (problem) throw new ContextError(`${problem}; previous graph kept.`);
+
+    const after = collect(root, mode, rev);
+    if (keyFor(root, mode, after, tool).source !== key.source || after.commit !== before.commit) {
+      throw new ContextError('source changed during the build; previous graph kept. Rebuild when work is quiet.');
+    }
+    const provenance = {
+      ...key, builtAt: new Date().toISOString(), graphSha256: sha256(bytes),
+      snapshotSha256: fingerprint(before.entries), tree: before.tree, excludedSymlinksOrSubmodules: before.excluded,
+    };
+    writeFileSync(join(gen, 'provenance.json'), `${JSON.stringify(provenance, null, 2)}\n`);
+    const tmpLink = join(out, `current.${randomBytes(4).toString('hex')}`);
+    symlinkSync(name, tmpLink);
+    renameSync(tmpLink, join(out, 'current'));
+    published = true;
+    return { status: 'built', provenance, want: key, gen };
+  } finally {
+    if (!published) rmSync(gen, { recursive: true, force: true });
+  }
+}
+
+function prune(out, keepDir) {
+  for (const entry of readdirSync(out)) {
+    const full = join(out, entry);
+    if (GEN.test(entry) && full !== keepDir && lstatOrNull(full)?.isDirectory()) rmSync(full, { recursive: true, force: true });
+  }
+}
+
+export function build(args) {
+  const ctx = { ...prepare(args), mode: args.mode, rev: args.rev };
+  ensureOutputDir(ctx.out);
+  return withLock(ctx.out, () => withTool(ctx, (tool) => {
+    const result = buildWith(ctx, tool);
+    prune(ctx.out, result.gen);
+    return result;
+  }));
+}
+
+export function ensure(args) {
+  const ctx = { ...prepare(args), mode: args.mode, rev: args.rev };
+  const first = withTool(ctx, (tool) => inspectWith(ctx, tool));
+  if (first.status === 'fresh') return first;
+  ensureOutputDir(ctx.out);
+  // Re-check under the lock so overlapping callers reuse a generation that just became fresh.
+  return withLock(ctx.out, () => withTool(ctx, (tool) => {
+    const again = inspectWith(ctx, tool);
+    if (again.status === 'fresh') return again;
+    const result = buildWith(ctx, tool);
+    prune(ctx.out, result.gen);
+    return result;
+  }));
+}
+
+// ---- CLI ----------------------------------------------------------------------------------
+
+export function handoffLine({ status, reason, provenance, want, gen }, task) {
   const key = provenance ?? want;
   const parts = [`graph=${status}${reason ? ` (${reason})` : ''}`];
-  if (key) {
-    parts.push(`evidence=${key.evidence}`, `commit=${key.commit}`,
-      `graph=${join(out, 'graph', 'graphify-out', 'graph.json')}`, `provenance=${join(out, PROVENANCE)}`);
-  }
+  if (key) parts.push(`evidence=${key.evidence}`, `commit=${key.commit}`);
+  if (gen) parts.push(`graph-json=${graphPath(gen)}`, `provenance=${join(gen, 'provenance.json')}`);
   if (task) parts.unshift(`task=${task}`);
   return parts.join('; ');
 }
 
+const usage = () => 'usage: graphify-context.mjs <status|ensure> --out ABS_DIR [--rev REV | --worktree] [--task TEXT]\n'
+  + '  default: committed snapshot of REV (exact commit evidence); --worktree: dirty snapshot, never exact-head evidence.\n'
+  + '  Run from the checkout to index; invoke the trusted helper by absolute path. GRAPHIFY_BIN overrides discovery.';
+
 function parseArgs(argv, env) {
   const [command, ...rest] = argv;
-  const options = { mode: 'committed', rev: 'HEAD', task: '', bin: env.GRAPHIFY_BIN ?? 'graphify' };
+  const options = { mode: 'committed', rev: 'HEAD', task: '', bin: env.GRAPHIFY_BIN ?? 'graphify', pathEnv: env.PATH };
   for (let i = 0; i < rest.length; i += 1) {
     const flag = rest[i];
     if (flag === '--worktree') options.mode = 'worktree';
@@ -255,20 +513,14 @@ function parseArgs(argv, env) {
   if (!['status', 'ensure'].includes(command)) throw new ContextError(usage());
   if (!options.out || !isAbsolute(options.out)) throw new ContextError(`--out must be an absolute path\n${usage()}`);
   if (options.mode === 'worktree' && options.rev !== 'HEAD') throw new ContextError('--rev cannot be combined with --worktree');
-  options.out = resolve(options.out);
   return { command, options };
 }
-
-const usage = () => 'usage: graphify-context.mjs <status|ensure> --out ABS_DIR [--rev REV | --worktree] [--task TEXT]\n'
-  + '  default: committed snapshot (exact commit evidence); --worktree: dirty snapshot, never exact-head evidence.';
 
 export function main(argv, cwd = process.cwd(), env = process.env) {
   const { command, options } = parseArgs(argv, env);
   const args = { cwd, ...options };
-  let result = inspect(args);
-  if (command === 'ensure' && result.status !== 'fresh') result = build(args);
-  const line = handoffLine(result, options.out, options.task);
-  return { code: result.status === 'fresh' || result.status === 'built' ? EXIT.ok : EXIT.stale, line };
+  const result = command === 'ensure' ? ensure(args) : inspect(args);
+  return { code: result.status === 'fresh' || result.status === 'built' ? EXIT.ok : EXIT.stale, line: handoffLine(result, options.task) };
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
