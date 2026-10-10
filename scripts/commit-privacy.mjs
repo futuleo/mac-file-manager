@@ -12,8 +12,17 @@ const ZERO = /^0+$/;
 export const isNoreplyEmail = (email) => NOREPLY.test(email);
 
 // True when the text contains an email address that is not an allowed noreply/example one.
-export const hasPersonalEmail = (text) =>
-  (String(text).match(EMAIL) ?? []).some((email) => !ALLOWED.test(email) && !ASSET.test(email));
+// Retina asset names are exempt only in file content (assets: true), never in metadata,
+// explicit Co-authored-by trailers or angle-bracketed addresses.
+export function hasPersonalEmail(text, { assets = false } = {}) {
+  const value = String(text);
+  const trailer = /co-authored-by\s*:/i.test(value);
+  return [...value.matchAll(EMAIL)].some(({ 0: email, index }) => {
+    if (ALLOWED.test(email)) return false;
+    const bracketed = value[index - 1] === '<' || value[index + email.length] === '>';
+    return !(assets && !trailer && !bracketed && ASSET.test(email));
+  });
+}
 
 // Never include email values in findings; only locations.
 export function auditCommit({ sha, authorEmail, committerEmail, authorName = '', committerName = '', message }) {
@@ -52,8 +61,9 @@ export function auditPatch(patch) {
     if (oldLeft > 0 || newLeft > 0) {
       if (line.startsWith('+')) {
         newLeft -= 1;
-        if (hasPersonalEmail(line.slice(1))) findings.push(`${sha}: added content in changed file #${fileNo} contains a personal email`);
+        if (hasPersonalEmail(line.slice(1), { assets: true })) findings.push(`${sha}: added content in changed file #${fileNo} contains a personal email`);
       } else if (line.startsWith('-')) oldLeft -= 1;
+      else if (line.startsWith(' ') || line === '') { oldLeft -= 1; newLeft -= 1; }
       continue;
     }
     if (line.startsWith('commit ')) { sha = line.slice(7, 19); fileNo = 0; }
@@ -74,11 +84,16 @@ export function auditPatch(patch) {
 }
 
 // revs is an array of git rev arguments, e.g. ['base..head'] or ['head'] for all ancestry.
-// -m also diffs merge commits against each parent so merge-only content is scanned.
+// Merge commits are diffed against each parent so merge-only content is scanned.
 export function auditRange(revs, cwd) {
   const findings = listCommits(revs, cwd).flatMap(auditCommit);
-  const patch = git(['log', '-p', '-m', '--format=commit %H', '--unified=0', '--no-color', '--no-ext-diff',
-    '--no-renames', ...revs], cwd);
+  // Canonical patch options plus isolated config, so repository, user and system settings
+  // (diff.interHunkContext, log.diffMerges, .gitattributes -diff, textconv) cannot hide content.
+  const patch = git(['log', '-p', '--diff-merges=separate', '--format=commit %H', '--unified=0',
+    '--inter-hunk-context=0', '--text', '--no-textconv', '--no-ext-diff', '--no-color', '--no-renames',
+    '--no-show-signature', ...revs], cwd, {
+    ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
+  });
   return [...findings, ...auditPatch(patch)];
 }
 
