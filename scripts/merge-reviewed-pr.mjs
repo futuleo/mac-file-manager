@@ -76,6 +76,8 @@ export function mergeReviewedPr(number, head, base) {
   const commits = api(`${root}/pulls/${number}/commits`, ['--paginate', '--slurp']).flat().map((item) => ({
     sha: item.sha,
     authorEmail: item.commit.author?.email ?? '',
+    authorName: item.commit.author?.name ?? '',
+    committerName: item.commit.committer?.name ?? '',
     committerEmail: item.commit.committer?.email ?? '',
     message: item.commit.message,
   }));

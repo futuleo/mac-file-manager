@@ -109,3 +109,109 @@ test('hook installer refuses to overwrite foreign hooks and is idempotent', () =
     assert.match(HOOKS['pre-commit'], /commit-privacy\.mjs" identity/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+const cli = (args, cwd) => {
+  try {
+    return { code: 0, out: execFileSync('node', [new URL('./commit-privacy.mjs', import.meta.url).pathname, ...args],
+      { cwd, env: baseEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) };
+  } catch (error) {
+    return { code: error.status, out: `${error.stdout}${error.stderr}` };
+  }
+};
+const zero = '0'.repeat(40);
+
+test('new destination ref audits all ancestry even with stale tracking refs', () => {
+  const r = repo();
+  try {
+    const first = r.commit('a.txt', 'a');
+    r.run(['update-ref', 'refs/remotes/origin/main', first]);
+    r.run(['update-ref', 'refs/remotes/other/main', first]);
+    r.commit('b.txt', 'b', 'x', { GIT_AUTHOR_EMAIL: personal });
+    const head = r.commit('c.txt', 'c');
+    assert.equal(auditPushLines(`refs/heads/f ${head} refs/heads/f ${zero}\n`, r.dir).length, 1);
+    const early = r.run(['rev-list', '--max-parents=0', 'HEAD']).trim();
+    r.run(['update-ref', 'refs/remotes/origin/main', early]);
+    assert.equal(auditPushLines(`refs/heads/f ${head} refs/heads/f ${zero}\n`, r.dir).length, 1);
+  } finally { r.done(); }
+});
+
+test('zero-base range audits the whole history, not just the tip', () => {
+  const r = repo();
+  try {
+    r.commit('a.txt', 'a');
+    r.commit('b.txt', 'b', 'x', { GIT_AUTHOR_EMAIL: personal });
+    const head = r.commit('c.txt', 'c');
+    const result = cli(['range', zero, head], r.dir);
+    assert.equal(result.code, 1);
+    assert.ok(!result.out.includes(personal));
+  } finally { r.done(); }
+});
+
+test('scans merge-only content', () => {
+  const r = repo();
+  try {
+    const base = r.commit('a.txt', 'a');
+    r.run(['checkout', '-q', '-b', 'side']);
+    r.commit('s.txt', 's');
+    r.run(['checkout', '-q', 'main']);
+    r.commit('m.txt', 'm');
+    r.run(['merge', '--no-commit', '--no-ff', 'side']);
+    writeFileSync(join(r.dir, 'only-in-merge.txt'), `x ${personal}`);
+    r.run(['add', 'only-in-merge.txt']);
+    r.run(['commit', '-q', '-m', 'merge']);
+    const findings = auditRange([`${base}..HEAD`], r.dir);
+    assert.ok(findings.length >= 1);
+    assert.ok(!findings.join().includes(personal));
+  } finally { r.done(); }
+});
+
+test('audits added lines that look like patch headers', () => {
+  const r = repo();
+  try {
+    const base = r.commit('a.txt', 'a');
+    const head = r.commit('b.txt', `++ ${personal}\n`);
+    assert.equal(auditRange([`${base}..${head}`], r.dir).length, 1);
+    const head2 = r.commit('c.txt', `-- ${personal}\n+++ x\n@@ -1 +1 @@\n`);
+    assert.equal(auditRange([`${head}..${head2}`], r.dir).length, 1);
+  } finally { r.done(); }
+});
+
+test('flags email-bearing author and committer names locally and via identity', () => {
+  const r = repo();
+  try {
+    const base = r.commit('a.txt', 'a');
+    const env = { GIT_AUTHOR_NAME: personal, GIT_COMMITTER_NAME: personal };
+    const head = r.commit('b.txt', 'b', 'x', env);
+    const findings = auditRange([`${base}..${head}`], r.dir);
+    assert.equal(findings.length, 2);
+    assert.ok(!findings.join().includes(personal));
+    assert.equal(auditIdentity(r.dir, { ...baseEnv, GIT_AUTHOR_NAME: personal }).length, 1);
+    assert.equal(auditIdentity(r.dir, { ...baseEnv, GIT_COMMITTER_NAME: personal }).length, 1);
+  } finally { r.done(); }
+});
+
+test('flags API-style commits with email-bearing names', () => {
+  const ok = { sha: 'a'.repeat(40), authorEmail: noreply, committerEmail: noreply, message: 'm' };
+  assert.equal(auditCommit({ ...ok, authorName: personal, committerName: 'u' }).length, 1);
+  assert.equal(auditCommit({ ...ok, authorName: 'u', committerName: personal }).length, 1);
+});
+
+test('detects numeric-leading domains but not retina asset names', () => {
+  for (const domain of ['123mail.test', '1-2.example.io', 'a.9z.test']) {
+    assert.ok(hasPersonalEmail(`x ${'p'}${at}${domain}`), domain);
+  }
+  assert.ok(!hasPersonalEmail(`icons/logo${at}2x.png`));
+  assert.ok(hasPersonalEmail(`Co-authored-by: P <p${at}123mail.test>`));
+});
+
+test('CLI output never contains rejected values, including via filenames', () => {
+  const r = repo();
+  try {
+    const base = r.commit('a.txt', 'a');
+    const head = r.commit(`${personal}.txt`, `data ${personal}`, `msg ${personal}`, { GIT_AUTHOR_NAME: personal });
+    const result = cli(['range', base, head], r.dir);
+    assert.equal(result.code, 1);
+    assert.ok(!result.out.includes(personal));
+    assert.ok(!result.out.includes('private.test'));
+  } finally { r.done(); }
+});
