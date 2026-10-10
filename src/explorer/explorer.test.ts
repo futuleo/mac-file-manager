@@ -163,3 +163,47 @@ describe("tabs reducer", () => {
     expect(s.tabs[0]!.selection.ids.size).toBe(0);
   });
 });
+
+describe("tab search state", () => {
+  const loc = { id: "aa", path: "/a", name: "a" } as never;
+  const file = (id: string, name = id) =>
+    ({ id, path: `/a/${name}`, name, kind: "file", size: 1, modifiedMs: null, isSymlink: false, isBrokenLink: false }) as FileEntry;
+  const start = () => {
+    let s = tabsReducer(initialTabsState, { type: "open", location: loc });
+    s = tabsReducer(s, { type: "search-start", tabId: "tab-1", query: "q", mode: "filename" });
+    return s;
+  };
+
+  it("applies results as upserts and drops events from an older query or other tab", () => {
+    let s = start();
+    s = tabsReducer(s, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("1"), file("2")], skipped: 1 });
+    s = tabsReducer(s, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("2", "renamed")], skipped: 0 });
+    expect(s.tabs[0]!.search!.entries.map((e) => e.name)).toEqual(["1", "renamed"]);
+    expect(s.tabs[0]!.search!.skipped).toBe(1);
+    s = tabsReducer(s, { type: "search-start", tabId: "tab-1", query: "r", mode: "content" });
+    expect(s.tabs[0]!.search!.key).toBe(2);
+    const stale = tabsReducer(s, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("9")], skipped: 0 });
+    expect(stale).toBe(s);
+    expect(tabsReducer(s, { type: "search-results", tabId: "tab-9", key: 2, entries: [file("9")], skipped: 0 })).toBe(s);
+  });
+
+  it("navigation and reload end the search; removals prune selection", () => {
+    let s = start();
+    s = tabsReducer(s, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("1"), file("2")], skipped: 0 });
+    s = tabsReducer(s, { type: "select", tabId: "tab-1", selection: { ids: new Set(["1", "2"]), anchor: "1", focus: "2" } });
+    s = tabsReducer(s, { type: "search-removed", tabId: "tab-1", key: 1, ids: ["2"] });
+    expect([...s.tabs[0]!.selection.ids]).toEqual(["1"]);
+    expect(tabsReducer(s, { type: "reload", tabId: "tab-1" }).tabs[0]!.search).toBeNull();
+    expect(tabsReducer(s, { type: "navigate", tabId: "tab-1", location: { id: "bb", path: "/b", name: "b" } as never }).tabs[0]!.search).toBeNull();
+    expect(tabsReducer(s, { type: "search-clear", tabId: "tab-1" }).tabs[0]!.search).toBeNull();
+  });
+
+  it("a failure is terminal and never an empty success", () => {
+    let s = start();
+    const error = { category: "notFound", operation: "search", context: null, message: "gone" } as const;
+    s = tabsReducer(s, { type: "search-failed", tabId: "tab-1", key: 1, error });
+    s = tabsReducer(s, { type: "search-state", tabId: "tab-1", key: 1, state: "live" });
+    s = tabsReducer(s, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("1")], skipped: 0 });
+    expect(s.tabs[0]!.search).toMatchObject({ status: "failed", error, entries: [] });
+  });
+});

@@ -26,16 +26,44 @@ interface Props {
   onRetry(): void;
   onBack(): void;
   onDismissAction(): void;
+  onRetrySearch(): void;
+  onClearSearch(): void;
 }
 
 const MAX_LISTED_FAILURES = 50;
 
-function ErrorView({ error, onRetry, onBack, canGoBack }: { error: AppError; onRetry(): void; onBack(): void; canGoBack: boolean }) {
+function SearchBanner({ search, scopeName, onClear }: { search: NonNullable<Tab["search"]>; scopeName: string; onClear(): void }) {
+  const what = search.mode === "content" ? "file contents" : "file names";
+  const caveat =
+    "Spotlight results are best-effort: recently created or changed files may not be indexed yet, some file types are not searchable by content, and entries may be stale.";
+  return (
+    <div className="search-banner" role="status">
+      <strong>
+        {search.status === "gathering" ? "Searching" : "Showing"} {what} for “{search.query}” in {scopeName}
+        {search.status === "gathering" ? "…" : ""}
+      </strong>{" "}
+      <span>
+        {search.status === "gathering"
+          ? "Results appear as Spotlight reports them."
+          : "Spotlight keeps this list up to date until you clear the search."}{" "}
+        {search.skipped > 0 &&
+          `${search.skipped} match${search.skipped === 1 ? "" : "es"} were left out because the item no longer exists or could not be read. `}
+        {search.limit !== null && `Stopped after ${search.limit} results; the list is incomplete. Narrow the search to see more. `}
+        {caveat}
+      </span>{" "}
+      <button type="button" className="banner-dismiss" onClick={onClear}>
+        Clear search
+      </button>
+    </div>
+  );
+}
+
+function ErrorView({ error, onRetry, onBack, canGoBack, title = "This folder can't be shown" }: { error: AppError; onRetry(): void; onBack(): void; canGoBack: boolean; title?: string }) {
   return (
     <div className="error-view" role="alert">
       <WarnGlyph size={32} />
       <div>
-        <p className="error-title">This folder can't be shown</p>
+        <p className="error-title">{title}</p>
         <p className="error-message">{error.message}</p>
         <p className="error-actions">
           <button type="button" className="command" onClick={onRetry}>
@@ -55,11 +83,18 @@ function ErrorView({ error, onRetry, onBack, canGoBack }: { error: AppError; onR
 /** The folder area of one tab: states, per-item failures, action errors and the file list. */
 export default function TabView(props: Props) {
   const { tab, rows } = props;
-  const { listing } = tab;
+  const { listing, search } = tab;
   const [showFailures, setShowFailures] = useState(false);
 
   let emptyMessage: string | null = null;
-  if (rows.length === 0) {
+  if (search) {
+    if (rows.length === 0) {
+      emptyMessage =
+        search.status === "gathering"
+          ? "Searching…"
+          : "Spotlight reported no matches. That does not prove nothing matches: the folder may not be indexed or the files may be too new.";
+    }
+  } else if (rows.length === 0) {
     if (listing.status === "loading") emptyMessage = "Loading…";
     else if (listing.status === "ready") {
       if (listing.entries.length > 0) emptyMessage = "This folder only contains hidden items. Turn on Hidden items in the View tab to see them.";
@@ -79,7 +114,10 @@ export default function TabView(props: Props) {
           </button>
         </div>
       )}
-      {listing.failures.length > 0 && listing.status !== "failed" && (
+      {search && search.status !== "failed" && (
+        <SearchBanner search={search} scopeName={props.label.replace(/^Contents of /, "")} onClear={props.onClearSearch} />
+      )}
+      {!search && listing.failures.length > 0 && listing.status !== "failed" && (
         <div role="alert" className="banner warning">
           <WarnGlyph />
           <span>
@@ -100,13 +138,22 @@ export default function TabView(props: Props) {
           )}
         </div>
       )}
-      {listing.status === "failed" ? (
+      {search?.status === "failed" && search.error ? (
+        <ErrorView
+          title="The search could not run"
+          error={search.error}
+          onRetry={props.onRetrySearch}
+          onBack={props.onClearSearch}
+          canGoBack
+        />
+      ) : !search && listing.status === "failed" ? (
         <ErrorView error={listing.error} onRetry={props.onRetry} onBack={props.onBack} canGoBack={props.canGoBack} />
       ) : (
         <FileList
           rows={rows}
           label={props.label}
-          busy={listing.status === "loading"}
+          busy={search ? search.status === "gathering" : listing.status === "loading"}
+          showLocation={!!search}
           emptyMessage={emptyMessage}
           selection={props.selection}
           sort={props.sort}

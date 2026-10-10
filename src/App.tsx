@@ -1,7 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { call } from "./backend/client";
-import { MENU_EVENT, type AppError, type FileEntry, type Places } from "./backend/contracts";
+import { MENU_EVENT, type AppError, type FileEntry, type Places, type SearchMode } from "./backend/contracts";
 import { toAppError } from "./backend/directory";
 import ContextMenu, { type MenuItem } from "./ContextMenu";
 import NameDialog from "./NameDialog";
@@ -11,6 +11,7 @@ import Ribbon from "./Ribbon";
 import Sidebar from "./Sidebar";
 import StatusBar from "./StatusBar";
 import TabReader from "./TabReader";
+import TabSearcher from "./TabSearcher";
 import TabStrip, { tabButtonId, tabPanelId } from "./TabStrip";
 import TabView from "./TabView";
 import * as hist from "./explorer/history";
@@ -39,6 +40,8 @@ interface NameState {
   entry: FileEntry;
   tabId: string;
   folderId: string;
+  /** Set when renaming from a search list: the query whose list holds the item. */
+  searchKey: number | null;
   error: string | null;
   busy: boolean;
 }
@@ -55,6 +58,7 @@ export default function App() {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [announcement, setAnnouncement] = useState("");
   const [addressFocus, setAddressFocus] = useState(0);
+  const [searchFocus, setSearchFocus] = useState(0);
   const scrollTops = useRef(new Map<string, number>());
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -73,7 +77,15 @@ export default function App() {
       }
     }
   }, []);
-  const operations = useOperations({ onChanged: (affected) => reloadFolders(affected) });
+  const operations = useOperations({
+    onChanged: (affected) => {
+      reloadFolders(affected);
+      // A search list can contain moved or trashed items: run those searches again.
+      for (const t of stateRef.current.tabs) {
+        if (t.search) dispatch({ type: "search-start", tabId: t.id, query: t.search.query, mode: t.search.mode });
+      }
+    },
+  });
 
   useEffect(() => savePreferences(prefs), [prefs]);
 
@@ -125,12 +137,16 @@ export default function App() {
   }, [places]);
 
   // Rows: hidden filter and sorting. While loading, rows stay in arrival order.
-  const hiddenCount = tab ? tab.listing.entries.filter(isHidden).length : 0;
+  const search = tab?.search ?? null;
+  const searching = search !== null;
+  const hiddenCount = tab && !search ? tab.listing.entries.filter(isHidden).length : 0;
   const rows = useMemo(() => {
     if (!tab) return [];
+    // Search results are shown as Spotlight reports them: an explicit query is not filtered by Hidden items.
+    if (tab.search) return tab.search.status === "gathering" ? tab.search.entries : sortEntries(tab.search.entries, prefs.sort);
     const visible = prefs.showHidden ? tab.listing.entries : tab.listing.entries.filter((e) => !isHidden(e));
     return tab.listing.status === "loading" ? visible : sortEntries(visible, prefs.sort);
-  }, [tab?.listing, prefs.showHidden, prefs.sort]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tab?.listing, tab?.search, prefs.showHidden, prefs.sort]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const activeId = tab?.id ?? null;
 
@@ -138,13 +154,13 @@ export default function App() {
   const selection = useMemo<Selection>(() => {
     if (!tab) return emptySelection;
     const sel = tab.selection;
-    if (prefs.showHidden) return sel;
+    if (prefs.showHidden || tab.search) return sel;
     const visible = new Set(rows.map((r) => r.id));
     const ids = new Set([...sel.ids].filter((id) => visible.has(id)));
     const anchor = sel.anchor !== null && visible.has(sel.anchor) ? sel.anchor : null;
     const focus = sel.focus !== null && visible.has(sel.focus) ? sel.focus : null;
     return ids.size === sel.ids.size && anchor === sel.anchor && focus === sel.focus ? sel : { ids, anchor, focus };
-  }, [tab?.selection, rows, prefs.showHidden]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tab?.selection, tab?.search, rows, prefs.showHidden]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const navigate = useCallback((tabId: string, target: Location, reveal: string | null = null) => {
     dispatch({ type: "navigate", tabId, location: target, reveal });
@@ -163,6 +179,22 @@ export default function App() {
     },
     [navigate],
   );
+
+  const startSearch = useCallback((tabId: string, query: string, mode: SearchMode) => {
+    dispatch({ type: "search-start", tabId, query, mode });
+  }, []);
+  const clearSearch = useCallback((tabId: string) => dispatch({ type: "search-clear", tabId }), []);
+
+  // "Show containing folder": navigate to the result's real parent and select it there.
+  const showContaining = useCallback((tabId: string, entry: FileEntry) => {
+    call("parent_directory", { id: entry.id }).then(
+      (parent) => {
+        if (parent) dispatch({ type: "navigate", tabId, location: locationOf(parent), reveal: entry.id });
+        else dispatch({ type: "action-error", tabId, error: toAppError("This item has no containing folder.", "show the containing folder") });
+      },
+      (reason) => dispatch({ type: "action-error", tabId, error: toAppError(reason, `show the folder of ${entry.name}`) }),
+    );
+  }, []);
 
   const goUp = useCallback(() => {
     const t = activeTab(stateRef.current);
@@ -263,7 +295,7 @@ export default function App() {
   const pasteHere = () => {
     const t = activeTab(stateRef.current);
     const here = t && hist.current(t.history);
-    if (!t || !here || !clipboard || clipboard.ids.length === 0) return;
+    if (!t || !here || t.search || !clipboard || clipboard.ids.length === 0) return;
     const { mode, ids } = clipboard;
     operations.start({
       kind: mode === "cut" ? "move" : "copy",
@@ -293,17 +325,25 @@ export default function App() {
     const here = t && hist.current(t.history);
     const entries = selectedEntries();
     if (!t || !here || entries.length !== 1) return;
-    setNameState({ mode: "rename", entry: entries[0]!, tabId: t.id, folderId: here.id, error: null, busy: false });
+    setNameState({
+      mode: "rename",
+      entry: entries[0]!,
+      tabId: t.id,
+      folderId: here.id,
+      searchKey: t.search?.key ?? null,
+      error: null,
+      busy: false,
+    });
   };
 
   const newFolder = () => {
     const t = activeTab(stateRef.current);
     const here = t && hist.current(t.history);
-    if (!t || !here) return;
+    if (!t || !here || t.search) return;
     call("create_folder", { parentId: here.id, name: null }).then(
       (entry) => {
         reloadFolders([here.id], { tabId: t.id, id: entry.id });
-        setNameState({ mode: "new", entry, tabId: t.id, folderId: here.id, error: null, busy: false });
+        setNameState({ mode: "new", entry, tabId: t.id, folderId: here.id, searchKey: null, error: null, busy: false });
       },
       (reason) => dispatch({ type: "action-error", tabId: t.id, error: toAppError(reason, "create the folder") }),
     );
@@ -320,7 +360,14 @@ export default function App() {
     call("rename_item", { id: current.entry.id, newName: name }).then(
       (entry) => {
         setNameState(null);
-        reloadFolders([current.folderId], { tabId: current.tabId, id: entry.id });
+        if (current.searchKey !== null) {
+          // The item stays where it was found: update the list and refresh its real folder.
+          dispatch({ type: "search-replace", tabId: current.tabId, key: current.searchKey, removeId: current.entry.id, entry });
+          call("parent_directory", { id: entry.id }).then(
+            (parent) => parent && reloadFolders([parent.id]),
+            () => undefined,
+          );
+        } else reloadFolders([current.folderId], { tabId: current.tabId, id: entry.id });
       },
       (reason) => setNameState({ ...current, busy: false, error: toAppError(reason, "rename the item").message }),
     );
@@ -359,6 +406,7 @@ export default function App() {
       case "enclosing-folder": return goUp();
       case "home": return t && home && navigate(t.id, home);
       case "address": return setAddressFocus((n) => n + 1);
+      case "search": return location ? setSearchFocus((n) => n + 1) : undefined;
       case "new-folder": return newFolder();
       case "copy": return copySelection("copy");
       case "cut": return copySelection("cut");
@@ -411,6 +459,9 @@ export default function App() {
       if (entry.kind === "directory") {
         items.push({ label: "Open in new tab", onSelect: () => newTab(locationOf(entry)) });
       }
+      if (tab.search) {
+        items.push({ label: "Show containing folder", onSelect: () => showContaining(tab.id, entry) });
+      }
       items.push(
         { separator: true },
         { label: "Cut", shortcut: "⌘X", onSelect: () => copySelection("cut") },
@@ -434,8 +485,8 @@ export default function App() {
           { separator: true },
           { label: "Hidden items", shortcut: "⇧⌘.", checked: prefs.showHidden, onSelect: () => setShowHidden(!prefs.showHidden) },
           { separator: true },
-          { label: "Paste", shortcut: "⌘V", unavailable: !clipboard, onSelect: pasteHere },
-          { label: "New folder", shortcut: "⇧⌘N", unavailable: !location, onSelect: newFolder },
+          { label: "Paste", shortcut: "⌘V", unavailable: !clipboard || searching, onSelect: pasteHere },
+          { label: "New folder", shortcut: "⇧⌘N", unavailable: !location || searching, onSelect: newFolder },
         ],
       });
     }
@@ -488,8 +539,8 @@ export default function App() {
         hasSelection={selection.ids.size > 0}
         showHidden={prefs.showHidden}
         sort={prefs.sort}
-        canPaste={!!clipboard && !!location}
-        canCreate={!!location}
+        canPaste={!!clipboard && !!location && !searching}
+        canCreate={!!location && !searching}
         canRename={selection.ids.size === 1}
         onCopy={() => copySelection("copy")}
         onCut={() => copySelection("cut")}
@@ -521,6 +572,10 @@ export default function App() {
         onNavigate={(target) => tab && navigate(tab.id, target)}
         onSubmit={submitAddress}
         onDismissError={() => tab && dispatch({ type: "address-error", tabId: tab.id, error: null })}
+        search={search ? { query: search.query, mode: search.mode } : null}
+        searchFocusRequest={searchFocus}
+        onSearch={(query, mode) => tab && startSearch(tab.id, query.trim(), mode)}
+        onClearSearch={() => tab && clearSearch(tab.id)}
       />
       <div className="panes">
         <Sidebar
@@ -540,6 +595,20 @@ export default function App() {
               dispatch={dispatch}
             />
           ))}
+          {state.tabs.map(
+            (t) =>
+              t.search && (
+                <TabSearcher
+                  key={t.id}
+                  tabId={t.id}
+                  searchKey={t.search.key}
+                  scopeId={t.search.scopeId}
+                  mode={t.search.mode}
+                  query={t.search.query}
+                  dispatch={dispatch}
+                />
+              ),
+          )}
           {tab && (
             <div
               role="tabpanel"
@@ -565,7 +634,7 @@ export default function App() {
                   tab={tab}
                   selection={selection}
                   rows={rows}
-                  label={location ? `Contents of ${location.name || "/"}` : "Folder contents"}
+                  label={search ? `Search results in ${location?.name || "/"}` : location ? `Contents of ${location.name || "/"}` : "Folder contents"}
                   sort={prefs.sort}
                   columns={prefs.columns}
                   canGoBack={hist.canGoBack(tab.history)}
@@ -580,6 +649,8 @@ export default function App() {
                   onRetry={() => dispatch({ type: "reload", tabId: tab.id })}
                   onBack={() => dispatch({ type: "back", tabId: tab.id })}
                   onDismissAction={() => dispatch({ type: "action-error", tabId: tab.id, error: null })}
+                  onRetrySearch={() => search && startSearch(tab.id, search.query, search.mode)}
+                  onClearSearch={() => clearSearch(tab.id)}
                 />
               )}
             </div>
@@ -597,7 +668,8 @@ export default function App() {
         hidden={prefs.showHidden ? 0 : hiddenCount}
         selected={selection.ids.size}
         selectedBytes={selectedBytes}
-        loading={tab?.listing.status === "loading"}
+        loading={search ? search.status === "gathering" : tab?.listing.status === "loading"}
+        searchStatus={search && search.status !== "failed" ? "Spotlight search (best-effort)" : null}
         formatBytes={formatSize}
       />
       <div className="visually-hidden" role="status" aria-live="polite">

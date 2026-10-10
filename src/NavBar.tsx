@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { AppError } from "./backend/contracts";
+import type { AppError, SearchMode } from "./backend/contracts";
 import { BackGlyph, ChevronGlyph, ForwardGlyph, RefreshGlyph, UpGlyph } from "./glyphs";
 import { ancestors, type Location } from "./explorer/path";
 
@@ -22,6 +22,14 @@ interface Props {
   /** Validates and navigates; resolves true when the address was accepted. */
   onSubmit(text: string): Promise<boolean>;
   onDismissError(): void;
+  /** The tab's active search, if any; its text and mode seed the search box. */
+  search: { query: string; mode: SearchMode } | null;
+  /** Increment to focus the search box (⌘F). */
+  searchFocusRequest: number;
+  /** Starts (or restarts) a search of the current folder. */
+  onSearch(query: string, mode: SearchMode): void;
+  /** Cancels the search and returns to the folder listing. */
+  onClearSearch(): void;
 }
 
 export default function NavBar(props: Props) {
@@ -30,6 +38,29 @@ export default function NavBar(props: Props) {
   const [text, setText] = useState("");
   const input = useRef<HTMLInputElement>(null);
   const crumbs = useRef<HTMLOListElement>(null);
+  const searchInput = useRef<HTMLInputElement>(null);
+  const [searchText, setSearchText] = useState(props.search?.query ?? "");
+  const [searchMode, setSearchMode] = useState<SearchMode>(props.search?.mode ?? "filename");
+  const seenSearchFocus = useRef(props.searchFocusRequest);
+  const searching = props.search !== null;
+
+  useEffect(() => {
+    if (props.searchFocusRequest !== seenSearchFocus.current) {
+      seenSearchFocus.current = props.searchFocusRequest;
+      searchInput.current?.focus();
+      searchInput.current?.select();
+    }
+  }, [props.searchFocusRequest]);
+
+  // A search that ends elsewhere (navigation, refresh) empties the box.
+  useEffect(() => {
+    if (!searching) setSearchText("");
+  }, [searching]);
+
+  const runSearch = (text: string, mode: SearchMode) => {
+    if (text.trim() === "") props.onClearSearch();
+    else props.onSearch(text, mode);
+  };
 
   // Each edit session has an id; a submission may only close the session that started it.
   const session = useRef(0);
@@ -149,7 +180,51 @@ export default function NavBar(props: Props) {
       <button type="button" className="icon-button" aria-label="Refresh" title="Refresh (⌘R)" disabled={!location} onClick={props.onRefresh}>
         <RefreshGlyph />
       </button>
-      <input className="search" type="search" aria-label="Search" placeholder="Search (not available yet)" disabled />
+      <div className="search-group" role="search">
+        <input
+          ref={searchInput}
+          className="search"
+          type="search"
+          aria-label="Search this folder"
+          placeholder={searchMode === "content" ? "Search contents" : "Search names"}
+          title="Search this folder and its subfolders with Spotlight (⌘F). Press Return to search."
+          disabled={!location}
+          spellCheck={false}
+          autoCapitalize="off"
+          autoCorrect="off"
+          maxLength={256}
+          value={searchText}
+          onChange={(e) => {
+            setSearchText(e.target.value);
+            if (e.target.value === "" && searching) props.onClearSearch();
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              runSearch(searchText, searchMode);
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              setSearchText("");
+              if (searching) props.onClearSearch();
+              searchInput.current?.blur();
+            }
+          }}
+        />
+        <select
+          className="search-mode"
+          aria-label="Search by"
+          disabled={!location}
+          value={searchMode}
+          onChange={(e) => {
+            const mode = e.target.value as SearchMode;
+            setSearchMode(mode);
+            if (searching && searchText.trim() !== "") props.onSearch(searchText, mode);
+          }}
+        >
+          <option value="filename">Name</option>
+          <option value="content">Contents</option>
+        </select>
+      </div>
     </div>
   );
 }

@@ -4,8 +4,11 @@ pub mod filesystem;
 mod macos;
 mod menu;
 pub mod operations;
+pub mod search;
 /// Owned scratch directories for the `examples/` spikes and unit tests.
 pub mod spike_fixture;
+#[cfg(target_os = "macos")]
+pub mod spotlight;
 pub mod tasks;
 
 use std::{
@@ -18,13 +21,14 @@ use std::{
 };
 
 use base64::Engine;
-use tauri::{Emitter, Runtime, State, WebviewWindow};
+use tauri::{Emitter, Manager, Runtime, State, WebviewWindow};
 
 use contracts::{
     AppError, ConflictDecision, DIRECTORY_EVENT, ErrorCategory, FileEntry, NativeCapabilities,
-    PlatformInfo, TASK_EVENT, TaskEvent, display_name,
+    PlatformInfo, SEARCH_EVENT, SearchEvent, SearchMode, TASK_EVENT, TaskEvent, display_name,
 };
 use operations::{SystemTrash, TransferMode};
+use search::Searches;
 use tasks::{HostControl, TaskGuard, Tasks};
 
 /// Configured deployment target, not a tested support claim. Keep in sync with
@@ -429,11 +433,119 @@ async fn rename_item(id: String, new_name: String) -> Result<FileEntry, AppError
     .map_err(|_| join_error(operation))?
 }
 
+/// Starts a Spotlight search of `scope_id` and its descendants. Returns once the
+/// query is queued; results, state changes and failures arrive on `SEARCH_EVENT`
+/// tagged with `search_id`. Spotlight results are best-effort (see README).
+#[tauri::command]
+async fn start_search<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    window: WebviewWindow<R>,
+    searches: State<'_, Arc<Searches>>,
+    search_id: String,
+    scope_id: String,
+    mode: SearchMode,
+    query: String,
+) -> Result<(), AppError> {
+    let operation = "search";
+    let query = search::normalize_query(&query)?;
+    let scope = filesystem::resolve_id(operation, &scope_id)?;
+    let scope = tauri::async_runtime::spawn_blocking(move || search::check_scope(&scope))
+        .await
+        .map_err(|_| join_error(operation))??;
+
+    searches.prune_closed();
+    let label = window.label().to_string();
+    let (session, feed) = searches.register(&search_id, || {
+        search::Session::spawn(
+            &search_id,
+            scope.clone(),
+            search::MAX_RESULTS,
+            move |event: SearchEvent| {
+                let _ = window.emit_to(label.as_str(), SEARCH_EVENT, event);
+            },
+        )
+    })?;
+    begin_native_search(app, session, feed, search_id, scope, mode, query)
+}
+
+#[cfg(target_os = "macos")]
+fn begin_native_search<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    session: Arc<search::Session>,
+    feed: search::Feed,
+    search_id: String,
+    scope: std::path::PathBuf,
+    mode: SearchMode,
+    query: String,
+) -> Result<(), AppError> {
+    let schedule: spotlight::Schedule = {
+        let app = app.clone();
+        Arc::new(move |work| {
+            let _ = app.run_on_main_thread(work);
+        })
+    };
+    let queued = session.clone();
+    app.run_on_main_thread(move || {
+        // A search cancelled before this ran never creates a query.
+        if queued.is_closed() {
+            return;
+        }
+        if let Err(error) = spotlight::start(&search_id, &scope, mode, &query, feed, schedule) {
+            queued.fail(error);
+        }
+    })
+    .map_err(|_| {
+        session.close(false);
+        join_error("search")
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn begin_native_search<R: Runtime>(
+    _app: tauri::AppHandle<R>,
+    session: Arc<search::Session>,
+    _feed: search::Feed,
+    _search_id: String,
+    _scope: std::path::PathBuf,
+    _mode: SearchMode,
+    _query: String,
+) -> Result<(), AppError> {
+    session.close(false);
+    Err(AppError::new(
+        ErrorCategory::Unsupported,
+        "search",
+        None,
+        "Spotlight search is only available on macOS.",
+    ))
+}
+
+/// Cancels a search and releases its native query. Idempotent: an unknown or
+/// finished search is not an error. The caller gets one final `cancelled` state.
+#[tauri::command]
+fn cancel_search<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    searches: State<'_, Arc<Searches>>,
+    search_id: String,
+) {
+    if let Some(session) = searches.take(&search_id) {
+        release_search(&app, &session, search_id);
+    }
+}
+
+fn release_search<R: Runtime>(app: &tauri::AppHandle<R>, session: &search::Session, id: String) {
+    session.close(true);
+    #[cfg(target_os = "macos")]
+    let _ = app.run_on_main_thread(move || spotlight::stop(&id));
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, id);
+}
+
 /// State and command registration, shared by the app and the mock-runtime tests.
 fn register<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
         .manage(Arc::new(DirectoryReads::default()))
         .manage(Arc::new(Tasks::default()))
+        .manage(Arc::new(Searches::default()))
         .invoke_handler(tauri::generate_handler![
             get_platform_info,
             get_home_directory,
@@ -450,7 +562,9 @@ fn register<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             cancel_task,
             edit_action,
             create_folder,
-            rename_item
+            rename_item,
+            start_search,
+            cancel_search
         ])
 }
 
@@ -458,6 +572,15 @@ pub fn run() {
     register(tauri::Builder::default())
         .menu(menu::build)
         .on_menu_event(menu::forward)
+        .on_window_event(|window, event| {
+            // Closing the window releases every native query it still owns.
+            if let tauri::WindowEvent::Destroyed = event {
+                let app = window.app_handle();
+                for (id, session) in app.state::<Arc<Searches>>().take_all() {
+                    release_search(app, &session, id);
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -587,6 +710,42 @@ mod tests {
 
         fn is_terminal(e: &Value) -> bool {
             e["type"] != "entries"
+        }
+
+        #[test]
+        fn search_commands_reject_bad_input_and_cancel_is_idempotent() {
+            let (_app, window) = app();
+            let fx = Fixture::create_in(&std::env::temp_dir(), "mfm-ipc-search").unwrap();
+            let scope = path_to_id(fx.path());
+            let start = |scope: &str, query: &str| {
+                invoke(
+                    &window,
+                    "start_search",
+                    json!({"searchId": "s1", "scopeId": scope, "mode": "filename", "query": query}),
+                )
+            };
+            assert_eq!(
+                start(&scope, "   ").unwrap_err()["category"],
+                "invalidInput"
+            );
+            assert_eq!(
+                start(&scope, &"x".repeat(1000)).unwrap_err()["category"],
+                "invalidInput"
+            );
+            assert_eq!(start("zz", "x").unwrap_err()["category"], "invalidInput");
+            let missing = path_to_id(&fx.path().join("missing"));
+            assert_eq!(start(&missing, "x").unwrap_err()["category"], "notFound");
+            let file = fx.write("f.txt", "1").unwrap();
+            assert_eq!(
+                start(&path_to_id(&file), "x").unwrap_err()["category"],
+                "invalidInput"
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    invoke(&window, "cancel_search", json!({"searchId": "unknown"})).unwrap(),
+                    Value::Null
+                );
+            }
         }
 
         #[test]
