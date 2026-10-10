@@ -53,6 +53,21 @@ npm run tauri build -- --no-bundle       # native release binary
 The `--no-bundle` build produces `src-tauri/target/release/mac-file-manager`
 (not a `.app`, not signed or notarized). Signing and notarization are out of scope.
 
+## Optional: Graphify code navigation
+
+The repository ships a compact Copilot skill at `.github/skills/graphify/SKILL.md`
+(project-scope discovery per the GitHub Copilot skills documentation). It is
+optional and not part of any build, test or review gate. It was tested with
+`graphifyy` 0.9.84; install it yourself if wanted, in an isolated environment
+(for example `uv tool install graphifyy`). The skill restricts use to local AST
+extraction (`--code-only`) with `GRAPHIFY_NO_AUTO_REFRESH=1`; no LLM, hooks or
+watchers. Write graph output to a directory outside version control (and never
+commit it). A graph is only a navigation aid for the revision it was built from,
+and there is no guarantee that it saves tokens or credits. `scripts/graphify-context.mjs`
+(`ensure`/`status`, covered by `node --test scripts/*.test.mjs`) builds or reuses a graph only while
+its commit/source fingerprint and tool version still match; see the skill and
+`.github/AUTONOMY.md` for the writer/reviewer handoff protocol.
+
 ## Structure
 
 - `src/` – React UI. `src/backend/contracts.ts` mirrors the Rust wire types and
