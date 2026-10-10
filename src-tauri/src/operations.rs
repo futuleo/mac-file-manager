@@ -393,6 +393,18 @@ struct Stamp {
 }
 
 impl Stamp {
+    /// Same item with the same content version (ignores ctime, which a rename changes).
+    fn same_version(&self, other: &Stamp) -> bool {
+        (self.dev, self.ino, self.size, self.mtime, self.mtime_nsec)
+            == (
+                other.dev,
+                other.ino,
+                other.size,
+                other.mtime,
+                other.mtime_nsec,
+            )
+    }
+
     fn of(meta: &Metadata) -> Self {
         Self {
             dev: meta.dev(),
@@ -859,6 +871,16 @@ impl<'a> Run<'a> {
         let temporary = dest_dir.join(format!("{stem}.tmp"));
         let holder = dest_dir.join(format!("{stem}.old"));
         let before = self.failure_count();
+        // File Replace was approved for a file or link; a source that has become a
+        // folder since the prompt needs its own decision, so nothing is replaced.
+        if fs::symlink_metadata(source).is_ok_and(|m| m.is_dir()) {
+            self.fail_msg(
+                source,
+                ErrorCategory::Io,
+                "This item changed into a folder after you chose Replace, so nothing was replaced. Try again.",
+            );
+            return Ok(true);
+        }
         let mut copied: Option<Copied> = Some(Vec::new());
         match self.copy_node(source, &temporary, true, &mut copied)? {
             Node::Done if self.failure_count() == before => {}
@@ -875,6 +897,26 @@ impl<'a> Run<'a> {
                 return Ok(true);
             }
         }
+        let prepared = match fs::symlink_metadata(&temporary) {
+            Ok(m) if !m.is_dir() => Stamp::of(&m),
+            other => {
+                if other.is_ok() {
+                    let _ = fs::remove_dir_all(&temporary);
+                    self.fail_msg(
+                        source,
+                        ErrorCategory::Io,
+                        "This item changed into a folder after you chose Replace, so nothing was replaced. Try again.",
+                    );
+                } else {
+                    self.fail_msg(
+                        source,
+                        ErrorCategory::Io,
+                        "The prepared copy disappeared; nothing was replaced.",
+                    );
+                }
+                return Ok(true);
+            }
+        };
         if let Err(e) = rename_swap(&temporary, target) {
             let _ = fs::remove_file(&temporary);
             if e.kind() == io::ErrorKind::NotFound {
@@ -884,12 +926,19 @@ impl<'a> Run<'a> {
             return Ok(true);
         }
         // `temporary` now holds whatever was at `target`.
+        let owned = match fs::symlink_metadata(target) {
+            Ok(m) if Stamp::of(&m).same_version(&prepared) => Stamp::of(&m),
+            _ => {
+                self.preserved(source, target, &temporary, "the new copy");
+                return Ok(true);
+            }
+        };
         let displaced = fs::symlink_metadata(&temporary);
         if !displaced
             .as_ref()
             .is_ok_and(|m| !m.is_dir() && (m.dev(), m.ino()) == approved)
         {
-            let restored = self.undo_swap(&temporary, target, source);
+            let restored = self.roll_back(&owned, &temporary, target, source);
             return Ok(!restored);
         }
         let held = target
@@ -897,7 +946,7 @@ impl<'a> Run<'a> {
             .map(|name| holder.join(name))
             .filter(|_| fs::create_dir(&holder).is_ok());
         let Some(held) = held else {
-            self.undo_swap(&temporary, target, source);
+            self.roll_back(&owned, &temporary, target, source);
             self.fail_msg(
                 source,
                 ErrorCategory::Io,
@@ -907,15 +956,12 @@ impl<'a> Run<'a> {
         };
         if let Err(e) = rename_noreplace(&temporary, &held) {
             let _ = fs::remove_dir(&holder);
-            self.undo_swap(&temporary, target, source);
+            self.roll_back(&owned, &temporary, target, source);
             self.fail_io(target, &e);
             return Ok(true);
         }
         if let Err(error) = self.trash.trash(&held) {
-            // Put the old item back; the new one returns to the held name and goes away.
-            if rename_swap(target, &held).is_ok() {
-                let _ = fs::remove_file(&held);
-            }
+            self.roll_back(&owned, &held, target, source);
             let _ = fs::remove_dir(&holder);
             self.fail(source, error);
             return Ok(true);
@@ -935,25 +981,68 @@ impl<'a> Run<'a> {
         Ok(true)
     }
 
-    /// Reverses the swap after the displaced item turned out not to be the
-    /// approved one. Returns `true` when the original was restored and the
-    /// conflict must be asked again.
-    fn undo_swap(&mut self, temporary: &Path, target: &Path, source: &Path) -> bool {
-        if rename_swap(temporary, target).is_ok() {
-            let _ = fs::remove_file(temporary);
-            true
-        } else {
-            self.fail_msg(
-                source,
-                ErrorCategory::Io,
-                format!(
-                    "\"{}\" changed while it was being replaced and could not be restored \
-                     automatically; the item that was there is now named \"{}\".",
-                    display_name(target),
-                    display_name(temporary)
-                ),
-            );
-            false
+    /// Reports items that were left where they are because they could not be
+    /// restored safely.
+    fn preserved(&mut self, source: &Path, target: &Path, other: &Path, what: &str) {
+        self.fail_msg(
+            source,
+            ErrorCategory::Io,
+            format!(
+                "\"{}\" was changed while it was being replaced, so nothing was deleted or restored automatically. \
+                 {what} may be at \"{}\" and the original item at \"{}\".",
+                display_name(target),
+                target.display(),
+                other.display()
+            ),
+        );
+    }
+
+    /// Puts the displaced original (at `displaced`) back at `target`, but only
+    /// discards the item installed by this operation (`owned`) if it is still
+    /// unchanged. Anything else is preserved and reported with its location.
+    /// Returns `true` when the original is back in place.
+    fn roll_back(&mut self, owned: &Stamp, displaced: &Path, target: &Path, source: &Path) -> bool {
+        match fs::symlink_metadata(target) {
+            Ok(m) if Stamp::of(&m) == *owned => {
+                if rename_swap(displaced, target).is_err() {
+                    self.preserved(source, target, displaced, "the new copy");
+                    return false;
+                }
+                // `displaced` now holds the item that was at `target`.
+                match fs::symlink_metadata(displaced) {
+                    Ok(m) if !m.is_dir() && Stamp::of(&m).same_version(owned) => {
+                        if fs::remove_file(displaced).is_err() {
+                            self.fail_msg(
+                                source,
+                                ErrorCategory::Io,
+                                format!(
+                                    "The original was restored, but a leftover temporary copy remains at \"{}\".",
+                                    displaced.display()
+                                ),
+                            );
+                        }
+                        true
+                    }
+                    _ => {
+                        // Something else slipped in: undo the exchange and keep both.
+                        let _ = rename_swap(displaced, target);
+                        self.preserved(source, target, displaced, "the item that took its place");
+                        false
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if rename_noreplace(displaced, target).is_ok() {
+                    true
+                } else {
+                    self.preserved(source, target, displaced, "nothing");
+                    false
+                }
+            }
+            _ => {
+                self.preserved(source, target, displaced, "an item changed by someone else");
+                false
+            }
         }
     }
 

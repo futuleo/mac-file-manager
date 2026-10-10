@@ -1024,3 +1024,190 @@ fn cancelling_a_folder_copy_discloses_the_partly_copied_folder() {
         "some run cancelled after a child had been copied"
     );
 }
+
+/// Copy + Replace of `a.txt` whose Trash call runs `hook(target)` and is then denied.
+fn denied_replace(
+    prefix: &str,
+    hook: impl Fn(&Path, &Path) + Sync,
+) -> (Fixture, PathBuf, PathBuf, TaskSummary) {
+    let f = fx(prefix);
+    let src = dir(&f, "src");
+    let dst = dir(&f, "dst");
+    fs::write(src.join("a.txt"), "incoming original").unwrap();
+    fs::write(dst.join("a.txt"), "old original").unwrap();
+    let target = dst.join("a.txt");
+    let aside = f.path().to_path_buf();
+    let trash = HookTrash {
+        hook: |_: &Path| hook(&target, &aside),
+        inner: FakeTrash {
+            deny: Some(PathBuf::from("a.txt")),
+            ..Default::default()
+        },
+    };
+    let ctl = Ctl::deciding(ConflictDecision::Replace, false);
+    run_transfer(
+        "t",
+        &ctl,
+        &trash,
+        TransferMode::Copy,
+        vec![src.join("a.txt")],
+        &dst,
+    );
+    let (summary, _) = ctl.summary();
+    (f, src, dst, summary)
+}
+
+fn failure_text(summary: &TaskSummary) -> String {
+    summary
+        .failed
+        .iter()
+        .map(|f| f.error.message.clone())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn find_holder(dst: &Path) -> Option<PathBuf> {
+    fs::read_dir(dst)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.to_string_lossy().ends_with(".old"))
+}
+
+#[test]
+fn denied_trash_restores_the_original_and_removes_only_the_unchanged_new_copy() {
+    let (f, src, dst, summary) = denied_replace("mfm-op-rb1", |_, _| {});
+    assert_eq!((summary.succeeded, summary.failed.len()), (0, 1));
+    assert_eq!(read(&dst.join("a.txt")), "old original");
+    assert_eq!(read(&src.join("a.txt")), "incoming original");
+    assert!(find_holder(&dst).is_none());
+    assert_eq!(fs::read_dir(&dst).unwrap().count(), 1, "no leftovers");
+    f.cleanup().unwrap();
+}
+
+#[test]
+fn denied_trash_keeps_edits_made_in_place_to_the_installed_copy() {
+    let (f, _, dst, summary) = denied_replace("mfm-op-rb2", |target, _| {
+        fs::write(target, "new edits while Trash pending").unwrap();
+    });
+    assert_eq!(read(&dst.join("a.txt")), "new edits while Trash pending");
+    let holder = find_holder(&dst).expect("original kept in its holding folder");
+    assert_eq!(read(&holder.join("a.txt")), "old original");
+    let text = failure_text(&summary);
+    assert!(
+        text.contains("changed while it was being replaced") && text.contains(".old"),
+        "{text}"
+    );
+    assert_eq!(summary.succeeded, 0);
+    f.cleanup().unwrap();
+}
+
+#[test]
+fn denied_trash_keeps_an_unrelated_file_that_took_the_name() {
+    let (f, _, dst, summary) = denied_replace("mfm-op-rb3", |target, aside| {
+        fs::rename(target, aside.join("installed-copy")).unwrap();
+        fs::write(target, "unrelated file").unwrap();
+    });
+    assert_eq!(read(&dst.join("a.txt")), "unrelated file");
+    assert_eq!(read(&f.path().join("installed-copy")), "incoming original");
+    let holder = find_holder(&dst).unwrap();
+    assert_eq!(read(&holder.join("a.txt")), "old original");
+    assert!(failure_text(&summary).contains("nothing was deleted"));
+    f.cleanup().unwrap();
+}
+
+#[test]
+fn denied_trash_with_a_vanished_target_puts_the_original_back() {
+    let (f, _, dst, summary) =
+        denied_replace("mfm-op-rb4", |target, _| fs::remove_file(target).unwrap());
+    assert_eq!(read(&dst.join("a.txt")), "old original");
+    assert!(find_holder(&dst).is_none());
+    assert_eq!(summary.failed.len(), 1);
+    f.cleanup().unwrap();
+}
+
+#[test]
+fn denied_trash_with_a_vanished_target_and_taken_name_reports_the_recovery_location() {
+    // The target vanishes and the original cannot come back because a folder now holds the name.
+    let (f, _, dst, summary) = denied_replace("mfm-op-rb5", |target, _| {
+        fs::remove_file(target).unwrap();
+        fs::create_dir(target).unwrap();
+        fs::write(target.join("sentinel"), "keep").unwrap();
+    });
+    assert_eq!(read(&dst.join("a.txt/sentinel")), "keep");
+    let holder = find_holder(&dst).unwrap();
+    assert_eq!(read(&holder.join("a.txt")), "old original");
+    assert!(failure_text(&summary).contains(".old"));
+    f.cleanup().unwrap();
+}
+
+#[test]
+fn a_replace_swap_that_displaces_an_unapproved_item_keeps_everything() {
+    let f = fx("mfm-op-rb6");
+    let src = dir(&f, "src");
+    let dst = dir(&f, "dst");
+    fs::write(src.join("a.txt"), "incoming original").unwrap();
+    fs::write(dst.join("a.txt"), "old original").unwrap();
+    let target = dst.join("a.txt");
+    let aside = f.path().join("old-a");
+    let calls = AtomicUsize::new(0);
+    let ctl = Ctl::new(move |_| {
+        if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            fs::rename(&target, &aside).unwrap();
+            fs::write(&target, "someone else's file").unwrap();
+            Some(Resolution {
+                decision: ConflictDecision::Replace,
+                apply_to_all: false,
+            })
+        } else {
+            Some(Resolution {
+                decision: ConflictDecision::Skip,
+                apply_to_all: false,
+            })
+        }
+    });
+    transfer(TransferMode::Copy, &ctl, vec![src.join("a.txt")], &dst);
+    assert_eq!(read(&dst.join("a.txt")), "someone else's file");
+    assert_eq!(read(&f.path().join("old-a")), "old original");
+    assert_eq!(fs::read_dir(&dst).unwrap().count(), 1);
+    f.cleanup().unwrap();
+}
+
+#[test]
+fn a_source_that_became_a_folder_after_the_file_prompt_is_not_used_for_replace() {
+    let f = fx("mfm-op-srcdir");
+    let src = dir(&f, "src");
+    let dst = dir(&f, "dst");
+    fs::write(src.join("a.txt"), "incoming").unwrap();
+    fs::write(dst.join("a.txt"), "old original").unwrap();
+    let source = src.join("a.txt");
+    let aside = f.path().join("a-moved");
+    let ctl = Ctl::new(move |prompt| {
+        assert_eq!(prompt.source_kind, EntryKind::File);
+        assert_eq!(prompt.destination_kind, EntryKind::File);
+        fs::rename(&source, &aside).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("sentinel"), "dir child").unwrap();
+        Some(Resolution {
+            decision: ConflictDecision::Replace,
+            apply_to_all: false,
+        })
+    });
+    let trash = FakeTrash::default();
+    run_transfer(
+        "t",
+        &ctl,
+        &trash,
+        TransferMode::Copy,
+        vec![src.join("a.txt")],
+        &dst,
+    );
+    let (summary, _) = ctl.summary();
+    assert_eq!((summary.succeeded, summary.failed.len()), (0, 1));
+    assert_eq!(read(&dst.join("a.txt")), "old original");
+    assert!(trash.trashed.lock().unwrap().is_empty());
+    assert_eq!(read(&src.join("a.txt/sentinel")), "dir child");
+    assert_eq!(read(&f.path().join("a-moved")), "incoming");
+    assert_eq!(fs::read_dir(&dst).unwrap().count(), 1);
+    f.cleanup().unwrap();
+}
