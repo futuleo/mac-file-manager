@@ -12,13 +12,13 @@ use std::{
     ffi::CStr,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use objc2::{
     AllocAnyThread, ClassType, MainThreadMarker, MainThreadOnly, define_class, msg_send,
     rc::Retained,
-    runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel},
+    runtime::{AnyClass, AnyObject, Bool, ProtocolObject, Sel},
     sel,
 };
 use objc2_app_kit::{
@@ -51,6 +51,8 @@ thread_local! {
     static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
     /// Id of the incoming file drag this app is handling, if any.
     static CURRENT: Cell<Option<u64>> = const { Cell::new(None) };
+    /// Drag id, pointer and modifier mask of the last update that was reported to the page.
+    static LAST_UPDATE: Cell<Option<(u64, f64, f64, u64)>> = const { Cell::new(None) };
     static SOURCE: RefCell<Option<Retained<DragSource>>> = const { RefCell::new(None) };
 }
 
@@ -138,13 +140,30 @@ fn to_operation(mode: Option<TransferMode>) -> NSDragOperation {
 }
 
 /// Pointer position in the view's CSS-pixel space (origin top-left).
+/// Top-left of the page inside the view. The web view extends under the title bar and WebKit
+/// insets the page by `obscuredContentInsets` (the safe area by default), so view coordinates
+/// are not page coordinates.
+fn content_origin(view: &NSView) -> (f64, f64) {
+    let responds: Bool =
+        unsafe { msg_send![view, respondsToSelector: sel!(obscuredContentInsets)] };
+    let insets: objc2_foundation::NSEdgeInsets = if responds.as_bool() {
+        // SAFETY: the selector was just confirmed and returns NSEdgeInsets.
+        unsafe { msg_send![view, obscuredContentInsets] }
+    } else {
+        view.safeAreaInsets()
+    };
+    (insets.left, insets.top)
+}
+
 fn location(view: &NSView, info: &ProtocolObject<dyn NSDraggingInfo>) -> (f64, f64) {
     let point = view.convertPoint_fromView(info.draggingLocation(), None);
-    if view.isFlipped() {
-        (point.x, point.y)
+    let (left, top) = content_origin(view);
+    let y = if view.isFlipped() {
+        point.y
     } else {
-        (point.x, view.bounds().size.height - point.y)
-    }
+        view.bounds().size.height - point.y
+    };
+    (point.x - left, y - top)
 }
 
 fn info_of(raw: &AnyObject) -> &ProtocolObject<dyn NSDraggingInfo> {
@@ -157,10 +176,26 @@ fn view_of(this: &AnyObject) -> &NSView {
     unsafe { &*(this as *const AnyObject as *const NSView) }
 }
 
-fn superclass_of(this: &AnyObject) -> &'static AnyClass {
-    this.class()
-        .superclass()
-        .expect("the runtime subclass has a superclass")
+unsafe extern "C" {
+    fn class_getMethodImplementation(class: *const AnyClass, name: Sel) -> *const std::ffi::c_void;
+    fn class_replaceMethod(
+        class: *const AnyClass,
+        name: Sel,
+        imp: *const std::ffi::c_void,
+        types: *const std::ffi::c_char,
+    ) -> *const std::ffi::c_void;
+}
+
+/// The implementations the web view class had before `install` replaced them.
+static ORIGINAL: OnceLock<[usize; 4]> = OnceLock::new();
+
+const ENTERED: usize = 0;
+const UPDATED: usize = 1;
+const EXITED: usize = 2;
+const PERFORM: usize = 3;
+
+fn original(slot: usize) -> usize {
+    ORIGINAL.get().expect("install runs before any drag")[slot]
 }
 
 fn mask_of(info: &ProtocolObject<dyn NSDraggingInfo>) -> Mask {
@@ -200,7 +235,15 @@ unsafe extern "C-unwind" fn dragging_entered(
         return NSDragOperation::None;
     }
     // SAFETY: forwards the same message to the superclass.
-    unsafe { msg_send![super(this, superclass_of(this)), draggingEntered: raw] }
+    let imp: unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *const AnyObject) -> NSDragOperation =
+        unsafe { std::mem::transmute(original(ENTERED)) };
+    unsafe {
+        imp(
+            this as *const AnyObject as *mut AnyObject,
+            sel!(draggingEntered:),
+            raw,
+        )
+    }
 }
 
 unsafe extern "C-unwind" fn dragging_updated(
@@ -215,9 +258,28 @@ unsafe extern "C-unwind" fn dragging_updated(
     let info = info_of(raw);
     let Some(id) = CURRENT.with(Cell::get) else {
         // SAFETY: forwards the same message to the superclass.
-        return unsafe { msg_send![super(this, superclass_of(this)), draggingUpdated: raw] };
+        let imp: unsafe extern "C-unwind" fn(
+            *mut AnyObject,
+            Sel,
+            *const AnyObject,
+        ) -> NSDragOperation = unsafe { std::mem::transmute(original(UPDATED)) };
+        return unsafe {
+            imp(
+                this as *const AnyObject as *mut AnyObject,
+                sel!(draggingUpdated:),
+                raw,
+            )
+        };
     };
     let (x, y) = location(view_of(this), info);
+    let mask_bits = info.draggingSourceOperationMask().0 as u64;
+    // AppKit repeats this call while the pointer rests. Re-reporting an unchanged
+    // position would keep invalidating the verdict a drop needs.
+    if LAST_UPDATE.with(Cell::get) == Some((id, x, y, mask_bits)) {
+        return with_hook(|hook| to_operation(hook.state.operation(id)))
+            .unwrap_or(NSDragOperation::None);
+    }
+    LAST_UPDATE.with(|last| last.set(Some((id, x, y, mask_bits))));
     with_hook(|hook| {
         hook.state.set_mask(id, mask_of(info));
         let pointer = hook.state.moved(id);
@@ -243,7 +305,15 @@ unsafe extern "C-unwind" fn dragging_exited(
     let this = unsafe { &*this };
     let Some(id) = CURRENT.with(Cell::take) else {
         // SAFETY: forwards the same message to the superclass.
-        let _: () = unsafe { msg_send![super(this, superclass_of(this)), draggingExited: info] };
+        let imp: unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *const AnyObject) =
+            unsafe { std::mem::transmute(original(EXITED)) };
+        unsafe {
+            imp(
+                this as *const AnyObject as *mut AnyObject,
+                sel!(draggingExited:),
+                info as *const _ as *const AnyObject,
+            )
+        };
         return;
     };
     with_hook(|hook| {
@@ -266,7 +336,15 @@ unsafe extern "C-unwind" fn perform_drag(
     let info = info_of(raw);
     let Some(id) = CURRENT.with(Cell::take) else {
         // SAFETY: forwards the same message to the superclass.
-        return unsafe { msg_send![super(this, superclass_of(this)), performDragOperation: raw] };
+        let imp: unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *const AnyObject) -> Bool =
+            unsafe { std::mem::transmute(original(PERFORM)) };
+        return unsafe {
+            imp(
+                this as *const AnyObject as *mut AnyObject,
+                sel!(performDragOperation:),
+                raw,
+            )
+        };
     };
     let accepted = with_hook(|hook| {
         hook.state.set_mask(id, mask_of(info));
@@ -303,56 +381,48 @@ pub fn install<R: Runtime>(window: &WebviewWindow<R>, state: Arc<DragState>) -> 
                 }
                 // SAFETY: a live NSView owned by the window; used on the main thread only.
                 let current = unsafe { (*view).class() };
-                let name = c"MfmDragWebView";
-                let class = if current.name() == name {
-                    current
-                } else {
-                    let mut builder = ClassBuilder::new(name, current)
-                        .ok_or("the drag class could not be created")?;
-                    // SAFETY: the function types match the NSDraggingDestination selectors.
-                    unsafe {
-                        builder.add_method(
+                if ORIGINAL.get().is_none() {
+                    // WebKit observes the view's own class (scroll pocket KVO), so the
+                    // methods are replaced in place; swapping in a subclass crashes AppKit.
+                    let table: [(Sel, usize, &std::ffi::CStr); 4] = [
+                        (
                             sel!(draggingEntered:),
-                            dragging_entered
-                                as unsafe extern "C-unwind" fn(
-                                    *mut AnyObject,
-                                    Sel,
-                                    *const AnyObject,
-                                )
-                                    -> NSDragOperation,
-                        );
-                        builder.add_method(
+                            dragging_entered as *const () as usize,
+                            c"Q@:@",
+                        ),
+                        (
                             sel!(draggingUpdated:),
-                            dragging_updated
-                                as unsafe extern "C-unwind" fn(
-                                    *mut AnyObject,
-                                    Sel,
-                                    *const AnyObject,
-                                )
-                                    -> NSDragOperation,
-                        );
-                        builder.add_method(
+                            dragging_updated as *const () as usize,
+                            c"Q@:@",
+                        ),
+                        (
                             sel!(draggingExited:),
-                            dragging_exited
-                                as unsafe extern "C-unwind" fn(
-                                    *mut AnyObject,
-                                    Sel,
-                                    *const AnyObject,
-                                ),
-                        );
-                        builder.add_method(
+                            dragging_exited as *const () as usize,
+                            c"v@:@",
+                        ),
+                        (
                             sel!(performDragOperation:),
-                            perform_drag
-                                as unsafe extern "C-unwind" fn(
-                                    *mut AnyObject,
-                                    Sel,
-                                    *const AnyObject,
-                                )
-                                    -> Bool,
-                        );
+                            perform_drag as *const () as usize,
+                            c"B@:@",
+                        ),
+                    ];
+                    let mut originals = [0usize; 4];
+                    for (slot, (selector, _, _)) in table.iter().enumerate() {
+                        // SAFETY: resolves the (possibly inherited) implementation.
+                        let imp = unsafe { class_getMethodImplementation(current, *selector) };
+                        if imp.is_null() {
+                            return Err("a drag method is missing".to_string());
+                        }
+                        originals[slot] = imp as usize;
                     }
-                    builder.register()
-                };
+                    let _ = ORIGINAL.set(originals);
+                    for (selector, imp, types) in table {
+                        // SAFETY: the function types match the NSDraggingDestination selectors.
+                        unsafe {
+                            class_replaceMethod(current, selector, imp as *const _, types.as_ptr());
+                        }
+                    }
+                }
                 HOOK.with(|hook| {
                     *hook.borrow_mut() = Some(Hook {
                         state,
@@ -361,8 +431,6 @@ pub fn install<R: Runtime>(window: &WebviewWindow<R>, state: Arc<DragState>) -> 
                         }),
                     });
                 });
-                // SAFETY: the subclass adds no instance variables, so the layout is unchanged.
-                unsafe { objc2::ffi::object_setClass(view, class) };
                 Ok(())
             })();
             let _ = tx.send(result);

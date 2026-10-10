@@ -40,14 +40,15 @@ pub struct Mask {
 }
 
 impl Mask {
-    /// `NSDragOperationCopy` = 1 and `NSDragOperationMove` = 16. Link, generic,
-    /// delete and private operations are deliberately not interpreted: a source
-    /// that offers only those is not accepted.
+    /// `NSDragOperationCopy` = 1 and `NSDragOperationMove` = 16. Finder narrows
+    /// its mask to `NSDragOperationGeneric` = 4 alone while Command is held
+    /// (observed with real gestures), which is its move gesture, so a source
+    /// offering generic without copy or move is read as move. Link, delete and
+    /// private operations are deliberately not interpreted.
     pub fn from_bits(bits: u64) -> Self {
-        Self {
-            copy: bits & 1 != 0,
-            moving: bits & 16 != 0,
-        }
+        let copy = bits & 1 != 0;
+        let moving = bits & 16 != 0 || (bits & 4 != 0 && !copy);
+        Self { copy, moving }
     }
 }
 

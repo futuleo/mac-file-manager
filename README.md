@@ -264,7 +264,7 @@ and `ns_view()`, which provide the native handles later slices need.
 | Trash | `NSFileManager.trashItemAtURL:resultingItemURL:error:` | Moved a fixture to `~/.Trash`, source gone, resulting URL returned (the spike removed its own file afterwards) |
 | System icons | `NSWorkspace.iconForFile:` | Returned an `NSImage` |
 | Quick Look | `QLPreviewPanel.sharedPreviewPanel` with a Rust-defined `QLPreviewPanelDataSource` (`define_class!`) | In a standalone AppKit process the panel became visible with the expected item URL; `makeKeyAndOrderFront` and `setDataSource` were sufficient. That spike alone did not prove Tauri integration; see [Quick Look](#quick-look) for the real window |
-| External drag source | `NSView.beginDraggingSessionWithItems:event:source:` with `NSURL` pasteboard writers on the webview's `NSView`; Tauri's built-in drag-drop only handles drops *into* the window | Now used by the app (see [Drag and drop](#drag-and-drop)); a real session needs a live mouse event, so it is **not** exercised by automation |
+| External drag source | `NSView.beginDraggingSessionWithItems:event:source:` with `NSURL` pasteboard writers on the webview's `NSView`; Tauri's built-in drag-drop only handles drops *into* the window | Now used by the app (see [Drag and drop](#drag-and-drop)); a real session needs a live mouse event; exercised by real gestures (see [Drag and drop](#drag-and-drop)) |
 
 Design consequences and limits:
 
@@ -286,8 +286,8 @@ Design consequences and limits:
   menu, and the real WebView-to-backend IPC round trip were **not** visually
   or interactively confirmed. Frontend tests mock `invoke`; backend command
   tests use Tauri's mock runtime (see Filesystem verification).
-- Real-gesture drag-and-drop to/from Finder, cross-volume drops, and macOS versions
-  other than 26.6.1 were not tested (see [Drag and drop](#drag-and-drop)).
+- Cross-volume drops, non-UTF-8 names on disk, keyboard access to dragging, visual
+  confirmation, and macOS versions other than 26.6.1 were not tested (see [Drag and drop](#drag-and-drop)).
 - The app icon is an original simple placeholder. The bundle step (`.app`/`.dmg`),
   signing and notarization were not performed.
 ## Explorer UI verification
@@ -414,12 +414,30 @@ Verification and limits:
   verdict refusal, wrong-destination claim refusal, conflict Skip and Keep both through the shared
   transfer service, text-only drags not claimed, and `start_drag` refusal without a pressed
   button. This is not Finder and not a real gesture.
-- **Not verified (still required acceptance work, not waived)**: real mouse gestures, Finder in
-  both directions (including copy/move modifier keys and conflicts as Finder presents them), and the
-  outbound `NSDraggingSession` itself. Blocker in the automation environment: synthesising a pointer
-  gesture needs the Accessibility permission (`AXIsProcessTrusted()` is false here, so
-  `CGEventPost` events are dropped), and `start_drag` additionally requires the hardware
-  `NSEvent.pressedMouseButtons` state, which only a real or injected HID press sets. Also
-  unverified: cross-volume moves, non-UTF-8 names on disk (APFS rejects them; only unit-tested),
-  and keyboard/screen-reader access to dragging (pointer-only; copy/cut/paste remains the keyboard
-  path).
+- **Real gestures (writer-run, owned temp fixtures, Accessibility granted)**: actual
+  `CGEvent` left-button drags with the built release app and a Finder window, destination bytes and
+  source state compared on disk. App to Finder: no modifier moved, Option copied (both bytes equal,
+  source kept), Command moved; Finder's own conflict sheets were answered: Skip kept both files
+  unchanged, Replace overwrote the destination (source removed) and Keep Both produced `e copy.txt`
+  next to the untouched original. The outbound `NSDraggingSession` started from the live mouse event
+  each time (the app reported "offered for copying; the receiving app does the copy", which is a
+  hand-off, not proof of transfer: only the destination bytes count). Finder to app, dropped on a
+  folder row: no modifier moved, Option copied, Command moved, a conflict showed the app's dialog and
+  Skip left both files unchanged, Keep Both created `g copy.txt` with the dropped bytes, Replace
+  overwrote the destination (the old file goes to the Trash). Cancel in the app dialog was not driven.
+- **Defects found by those gestures (fixed)**: (1) the release app aborted at launch
+  (`Assertion failed: (imp != NULL), NSDP_getComputedPropertyValue` from `NSScrollPocket`
+  key-value observing) because the view's class was swapped with `object_setClass`; the four
+  destination methods are now replaced in place on the web view's own class, once per process, and
+  forward to the saved original implementations. (2) Page coordinates were off by the 32 pt title
+  bar (`obscuredContentInsets`) because the web view extends under it, so drops on a folder row
+  landed on the open folder; the pointer now subtracts the insets. (3) With Command held Finder
+  offers the *generic* operation alone, which was refused; generic without copy or move is now
+  read as move. Headless and mocked tests cannot show (1) or (2); only the real gestures did.
+- **Not verified (still required acceptance work, not waived)**: cross-volume moves (no second
+  volume was used), non-UTF-8 names on disk (APFS rejects them; only unit-tested), the app's
+  Cancel button during a Finder drop, Finder gestures on a second window or Spaces,
+  keyboard/screen-reader access to dragging (pointer-only; copy/cut/paste remains the keyboard
+  path), visual confirmation of hover highlights (Screen Recording was not granted; only the
+  accessibility tree and bytes were read), and macOS versions other than 26.6.1. One drop landed on
+  another application's window during gesture calibration; only owned fixture files were involved.

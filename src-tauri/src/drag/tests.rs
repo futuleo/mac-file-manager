@@ -31,7 +31,12 @@ fn settle(state: &DragState, id: u64, token: u64, dest: Option<PathBuf>) -> Hove
 #[test]
 fn modifier_masks_choose_operations() {
     assert_eq!(Mask::from_bits(1 | 16), BOTH);
-    assert_eq!(Mask::from_bits(2 | 4 | 8), Mask::default());
+    assert_eq!(Mask::from_bits(2 | 8), Mask::default());
+    // Finder's mask while Command is held is generic alone; its default mask is 55.
+    assert_eq!(Mask::from_bits(4), MOVE);
+    assert_eq!(Mask::from_bits(55), BOTH);
+    assert_eq!(Mask::from_bits(1), COPY);
+    assert_eq!(Mask::from_bits(4 | 1), COPY);
     assert_eq!(choose_operation(COPY, true), Some(TransferMode::Copy));
     assert_eq!(choose_operation(MOVE, false), Some(TransferMode::Move));
     assert_eq!(choose_operation(BOTH, true), Some(TransferMode::Move));
