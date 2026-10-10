@@ -17,6 +17,11 @@ approve your own work, merge, bypass protection, or add unrelated scope.
 Do not change the merge gate, workflow, or review policy to make failing work pass.
 Report a genuine environment blocker explicitly instead of claiming completion.
 
+Graph context is optional, for broad architecture questions only; skip it for simple tasks.
+When useful, follow the Graphify context protocol in .github/AUTONOMY.md: ensure/update after
+relevant edits (`--worktree` is dirty navigation, not evidence). Never push the graph.
+Graph handoff fields (graph status, path) supplement and never replace the PR URL, exact SHAs, checks and acceptance report.
+
 Before committing, run `node scripts/commit-privacy.mjs identity`; before pushing, audit the
 whole outgoing range with `node scripts/commit-privacy.mjs range <base> <head>`. Use only GitHub
 noreply emails, never print personal emails, and push only the assigned branch.

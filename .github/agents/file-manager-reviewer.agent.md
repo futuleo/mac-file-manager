@@ -22,3 +22,6 @@ publishing. If either changed, report that your review is stale instead of publi
 Send findings and the attested SHAs to the coordinator.
 Also verify that no commit in the PR range exposes a personal email (author, committer,
 message, trailers or content); report locations only, never the email values.
+Graph context is optional navigation, never evidence. If wanted, build a clean snapshot of the exact
+assigned head with the trusted helper (see the Graphify context protocol in .github/AUTONOMY.md);
+never use the writer's graph, a stale or main graph, or the candidate's own helper/skill as trusted.

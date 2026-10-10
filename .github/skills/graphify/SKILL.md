@@ -39,6 +39,46 @@ historical revision, index a `git archive` snapshot instead of switching branche
 Rebuild after relevant changes; a commit hash alone does not cover dirty edits.
 Do not rebuild merely because this skill was loaded.
 
+## Freshness helper
+
+`scripts/graphify-context.mjs` automates the steps above on demand (no watcher or hook).
+It indexes the repository of its **current working directory**, so run it from the checkout
+to index, and invoke the helper by absolute path:
+
+```sh
+cd ASSIGNED_CHECKOUT && node ABS_HELPER_PATH ensure --out ABS_ARTIFACT_DIR [--rev REV | --worktree] [--task TEXT]
+cd ASSIGNED_CHECKOUT && node ABS_HELPER_PATH status --out ABS_ARTIFACT_DIR [--rev REV | --worktree]
+```
+
+- `--out` is an absolute directory outside the worktree (symlinks resolved; it may not
+  contain the repository). It must be new, empty, or previously created by the helper
+  (regular-file marker). The helper never deletes anything in it except its own failed
+  staging; old `gen-*` generations are retained, so remove them manually when done.
+  A crashed build leaves `.lock`; callers fail with a "busy or stale lock" error and the
+  lock must be removed by hand (no automatic reclaim).
+- Default is a snapshot of the committed `REV` built from exact Git tree blobs (ignoring
+  `export-ignore`), verified against the tree; symlinks and submodules are excluded and
+  counted in provenance. `--worktree` snapshots files from disk (edits, additions,
+  deletions), rejects symlinked parent directories, is labelled
+  `dirty-worktree-not-exact-head` and is only for a writer's own navigation.
+- `ensure` reuses the graph only while commit/tree (or worktree fingerprint), graphify
+  version, executable/package bytes and extraction settings match and `graph.json` is
+  structurally valid; otherwise it rebuilds. Each build is staged in its own generation and
+  published atomically under a lock; any failure, mid-build source change or snapshot
+  modification during extraction keeps the previous generation. Missing or malformed
+  `current`/provenance is reported stale and rebuilt by `ensure`. `status` never builds (exit 2 missing/stale; exit 3 graphify not
+  installed, so use direct source search).
+- Published artifacts must be regular files below non-symlink directories; symlinked
+  `graph.json`/provenance/parents are reported stale and never read or overwritten.
+- graphify is executed only if it resolves outside the indexed repository, with an empty
+  owned HOME/config/cache and a bounded PATH; indexed source is never executed.
+- It prints one handoff line (task, graph state, evidence label, commit, graph and
+  provenance paths). Graph fields supplement, and never replace, the mandatory PR URL,
+  exact SHAs, checks and native-acceptance limitations in a report.
+- Reviewers: `cd` into the assigned PR worktree and run the trusted helper by absolute
+  path (the main/coordinator checkout's copy, never the PR's) with `--rev <exact head>` and
+  a fresh `--out`. Do not reuse the writer's graph.
+
 ## Local commands
 
 Replace uppercase path placeholders with resolved, explicitly chosen paths.
