@@ -16,3 +16,7 @@ Fix feedback in the same branch and PR. Never publish agent/independent-review,
 approve your own work, merge, bypass protection, or add unrelated scope.
 Do not change the merge gate, workflow, or review policy to make failing work pass.
 Report a genuine environment blocker explicitly instead of claiming completion.
+
+Before committing, run `node scripts/commit-privacy.mjs identity`; before pushing, audit the
+whole outgoing range with `node scripts/commit-privacy.mjs range <base> <head>`. Use only GitHub
+noreply emails, never print personal emails, and push only the assigned branch.

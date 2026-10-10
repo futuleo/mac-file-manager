@@ -20,3 +20,5 @@ findings, success only for work that meets its bounded scope and has no blockers
 Follow the status contract in .github/AUTONOMY.md. Recheck head and base before
 publishing. If either changed, report that your review is stale instead of publishing success.
 Send findings and the attested SHAs to the coordinator.
+Also verify that no commit in the PR range exposes a personal email (author, committer,
+message, trailers or content); report locations only, never the email values.

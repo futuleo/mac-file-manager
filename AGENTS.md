@@ -3,13 +3,27 @@
 ## Project
 
 - This repository is a macOS file manager project.
-- The repository currently contains only a README and license; no application stack or build workflow has been established.
+- The repository contains a Tauri 2 + React/TypeScript + Rust scaffold, a read-only filesystem backend and an Explorer UI shell. File operations, search, preview and drag-and-drop are not implemented yet; see `plan.md` and `README.md` for the documented build and check commands.
 
 ## Working In This Repository
 
 - Inspect the existing project structure and documentation before introducing a framework, dependency, or build tool.
 - Follow established conventions as the project takes shape, and keep changes focused on the requested behavior.
 - Do not invent build, test, or lint commands. Use the checks documented by the project; if none exist, report that verification is unavailable.
+
+## Commit privacy
+
+- No personal email address may appear in a commit's author or committer, its message or
+  `Co-authored-by` trailers, or authored repository content. Use only
+  `<id>+<login>@users.noreply.github.com` (or `noreply@github.com`) identities.
+  Keep the required Copilot App noreply co-author trailer.
+- Before committing, verify effective identities (environment overrides included) with
+  `node scripts/commit-privacy.mjs identity`. Optionally run `node scripts/install-git-hooks.mjs`
+  to add pre-commit/pre-push hooks; it never overwrites existing hooks.
+- Audit every commit in an outgoing range with `node scripts/commit-privacy.mjs range <base> <head>`.
+  Never publish old refs, tags, `--all` or `--mirror`; push only the assigned branch.
+- Never print rejected email values in logs, PRs or reports.
+- Account-level GitHub email privacy settings are outside the repository and must be set by the user.
 - Keep user-facing behavior and macOS platform conventions in mind when implementation choices are needed.
 
 ## Autonomous Development

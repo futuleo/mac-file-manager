@@ -1,10 +1,29 @@
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { auditCommit, hasPersonalEmail, isNoreplyEmail } from './commit-privacy.mjs';
 
 export const REPOSITORY = 'futuleo/mac-file-manager';
 export const REVIEW_CONTEXT = 'agent/independent-review';
 
-export function assertMergeable({ pr, mainSha, statuses, checks, reviews, threads }, head, base) {
+export const COPILOT_TRAILER = 'Co-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>';
+
+// Squash identity and text are built here, never taken from PR-controlled defaults.
+export function squashRequest(pr, head, authorEmail) {
+  if (!isNoreplyEmail(authorEmail)) throw new Error('Merge author email is not a GitHub noreply address.');
+  const title = String(pr.title ?? '');
+  const safeTitle = title && !/[\r\n]/.test(title) && !hasPersonalEmail(title) && !title.includes('@')
+    ? title : 'Reviewed pull request';
+  return {
+    pullRequestId: pr.node_id,
+    expectedHeadOid: head,
+    mergeMethod: 'SQUASH',
+    authorEmail,
+    commitHeadline: `${safeTitle} (#${pr.number})`,
+    commitBody: `Squash merge of reviewed head ${head}.\n\n${COPILOT_TRAILER}`,
+  };
+}
+
+export function assertMergeable({ pr, mainSha, statuses, checks, reviews, threads, commits }, head, base) {
   const require = (condition, message) => {
     if (!condition) throw new Error(message);
   };
@@ -31,6 +50,9 @@ export function assertMergeable({ pr, mainSha, statuses, checks, reviews, thread
     'A reviewer is still requesting changes.');
   require(!threads.pageInfo.hasNextPage, 'Too many review threads; manual inspection required.');
   require(threads.nodes.every((thread) => thread.isResolved), 'Unresolved review threads remain.');
+  require(Array.isArray(commits) && commits.length > 0 && commits.length === pr.commits, 'PR commits were not inspected for email privacy.');
+  const privacy = commits.flatMap(auditCommit);
+  require(privacy.length === 0, `Commit privacy violations block merge:\n${privacy.join('\n')}`);
   require(pr.mergeable === true && pr.mergeable_state === 'clean',
     'GitHub does not report a clean, mergeable PR.');
 }
@@ -51,6 +73,12 @@ export function mergeReviewedPr(number, head, base) {
   const statuses = api(`${root}/commits/${head}/status`).statuses;
   const checks = api(`${root}/commits/${head}/check-runs`, ['--paginate', '--slurp'])
     .flatMap((page) => page.check_runs);
+  const commits = api(`${root}/pulls/${number}/commits`, ['--paginate', '--slurp']).flat().map((item) => ({
+    sha: item.sha,
+    authorEmail: item.commit.author?.email ?? '',
+    committerEmail: item.commit.committer?.email ?? '',
+    message: item.commit.message,
+  }));
   const reviews = api(`${root}/pulls/${number}/reviews`, ['--paginate', '--slurp']).flat();
   const query = `query($number:Int!) {
     repository(owner:"futuleo",name:"mac-file-manager") {
@@ -62,13 +90,19 @@ export function mergeReviewedPr(number, head, base) {
   const graph = api('graphql', ['-f', `query=${query}`, '-F', `number=${number}`]);
   if (graph.errors) throw new Error(`Review-thread query failed: ${JSON.stringify(graph.errors)}`);
   assertMergeable({
-    pr, mainSha: main.object.sha, statuses, checks, reviews,
+    pr, mainSha: main.object.sha, statuses, checks, reviews, commits,
     threads: graph.data.repository.pullRequest.reviewThreads,
   }, head, base);
-  const result = api(`${root}/pulls/${number}/merge`, ['--method', 'PUT', '--input', '-'],
-    JSON.stringify({ sha: head, merge_method: 'squash' }));
-  if (!result.merged) throw new Error(`GitHub refused merge: ${result.message}`);
-  return result;
+  const viewer = api('user');
+  const request = squashRequest(pr, head, `${viewer.id}+${viewer.login}@users.noreply.github.com`);
+  const mutation = `mutation($input:MergePullRequestInput!) {
+    mergePullRequest(input:$input) { pullRequest { merged mergeCommit { oid } } }
+  }`;
+  const merged = api('graphql', ['--input', '-'], JSON.stringify({ query: mutation, variables: { input: request } }));
+  if (merged.errors || !merged.data?.mergePullRequest?.pullRequest?.merged) {
+    throw new Error(`GitHub refused merge: ${JSON.stringify(merged.errors ?? 'not merged')}`);
+  }
+  return merged.data.mergePullRequest.pullRequest;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
