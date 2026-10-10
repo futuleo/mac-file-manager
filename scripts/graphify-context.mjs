@@ -2,20 +2,22 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
   accessSync, closeSync, constants, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync,
-  readSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync,
+  readlinkSync, readSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 // Optional, on-demand, local-only graph freshness helper. A graph is navigation, never evidence.
-// Each build is staged in its own generation directory; `current` is switched atomically under a lock.
+// Each build is staged in its own generation directory; the `current` symlink is switched atomically under
+// a lock. Old generations are kept; nothing in --out is ever deleted except a build's own failed staging.
 const MARKER = '.graphify-context';
 const EXTRACT_ARGS = ['--code-only', '--max-workers', '2'];
 const SCHEMA = 2;
 const GEN = /^gen-[0-9a-f]{16}$/;
+const HEX = /^[0-9a-f]{64}$/;
 const LOCK_WAIT_MS = 100;
-const LOCK_TRIES = 1200;
+const LOCK_TRIES = 300;
 export const EXIT = { ok: 0, failure: 1, stale: 2, missingTool: 3 };
 
 export class ContextError extends Error {
@@ -79,14 +81,20 @@ function checkOutput(out, root) {
 
 function ensureOutputDir(out) {
   const stat = lstatOrNull(out);
+  const marker = join(out, MARKER);
   if (!stat) {
     mkdirSync(out, { recursive: true });
   } else if (!stat.isDirectory()) {
     throw new ContextError('--out exists and is not a directory.');
-  } else if (readdirSync(out).length > 0 && !lstatOrNull(join(out, MARKER))) {
-    throw new ContextError('--out is not empty and is not a graphify-context directory; refusing to use it.');
   }
-  writeFileSync(join(out, MARKER), 'managed by scripts/graphify-context.mjs\n');
+  const markerStat = lstatOrNull(marker);
+  if (markerStat) {
+    if (!markerStat.isFile()) throw new ContextError('--out has a non-regular graphify-context marker; refusing to use it.');
+  } else if (readdirSync(out).length > 0) {
+    throw new ContextError('--out is not empty and is not a graphify-context directory; refusing to use it.');
+  } else {
+    writeFileSync(marker, 'managed by scripts/graphify-context.mjs\n', { flag: 'wx' });
+  }
 }
 
 function listFiles(dir, prefix = '') {
@@ -275,8 +283,7 @@ function lightSource(root, mode, rev) {
 const KEY_FIELDS = ['schema', 'mode', 'evidence', 'repoRoot', 'commit', 'source', 'tool', 'extractArgs'];
 
 // Graphify node-link format: unique string node ids; links reference existing ids.
-export function graphProblem(bytes, expectedSha) {
-  if (expectedSha !== undefined && sha256(bytes) !== expectedSha) return 'graph output changed since it was built';
+export function graphProblem(bytes) {
   let graph;
   try {
     graph = JSON.parse(bytes.toString('utf8'));
@@ -305,22 +312,31 @@ const graphPath = (gen) => join(gen, 'graph', 'graphify-out', 'graph.json');
 
 function currentGeneration(out) {
   const link = join(out, 'current');
-  if (!lstatOrNull(link)) return null;
-  const target = realpathSync(link);
-  if (dirname(target) !== out || !GEN.test(basename(target))) return { corrupt: true };
-  return { dir: target };
+  const stat = lstatOrNull(link);
+  if (!stat) return null;
+  if (!stat.isSymbolicLink()) return { corrupt: 'current is not a symlink' };
+  const name = readlinkSync(link);
+  if (!GEN.test(name)) return { corrupt: 'current points outside the generation layout' };
+  const dir = join(out, name);
+  if (!lstatOrNull(dir)?.isDirectory()) return { corrupt: 'current generation is missing' };
+  return { dir };
 }
+
+const wellFormed = (p) => p !== null && typeof p === 'object' && HEX.test(p.graphSha256) && HEX.test(p.snapshotSha256)
+  && typeof p.builtAt === 'string' && typeof p.tree === 'string' && Number.isInteger(p.excludedSymlinksOrSubmodules);
 
 function inspectWith({ root, out, mode, rev }, tool) {
   const current = currentGeneration(out);
   if (!current) return { status: 'missing', reason: 'no published graph for this output' };
-  if (current.corrupt) return { status: 'stale', reason: 'current generation is invalid' };
+  if (current.corrupt) return { status: 'stale', reason: current.corrupt };
   let provenance;
   try {
     provenance = JSON.parse(readFileSync(join(current.dir, 'provenance.json'), 'utf8'));
-  } catch {
+  } catch (error) {
+    if (!(error instanceof SyntaxError) && error.code !== 'ENOENT') throw error;
     return { status: 'stale', reason: 'provenance is missing or corrupt' };
   }
+  if (!wellFormed(provenance)) return { status: 'stale', reason: 'provenance is malformed' };
   const want = keyFor(root, mode, lightSource(root, mode, rev), tool);
   const changed = KEY_FIELDS.filter((field) => JSON.stringify(provenance[field]) !== JSON.stringify(want[field]));
   const base = { provenance, want, gen: current.dir };
@@ -332,7 +348,7 @@ function inspectWith({ root, out, mode, rev }, tool) {
     if (error.code !== 'ENOENT') throw error;
     return { status: 'stale', reason: 'graph output is missing', ...base };
   }
-  const problem = graphProblem(bytes, provenance.graphSha256);
+  const problem = sha256(bytes) !== provenance.graphSha256 ? 'graph output changed since it was built' : graphProblem(bytes);
   return problem ? { status: 'stale', reason: problem, ...base } : { status: 'fresh', ...base };
 }
 
@@ -348,49 +364,27 @@ export function inspect(args) {
 
 // ---- build --------------------------------------------------------------------------------
 
-function holderDead(lock) {
-  let pid;
-  try {
-    pid = Number(readFileSync(join(lock, 'pid'), 'utf8'));
-  } catch (error) {
-    if (error.code === 'ENOENT') return false;
-    throw error;
-  }
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch (error) {
-    if (error.code === 'ESRCH') return true;
-    if (error.code === 'EPERM') return false;
-    throw error;
-  }
-}
-
-function withLock(out, fn) {
+// No automatic stale-lock recovery: a crashed holder leaves `.lock`, which must be removed by hand.
+function withLock(out, tries, fn) {
   const lock = join(out, '.lock');
+  const token = randomBytes(16).toString('hex');
   for (let attempt = 0; ; attempt += 1) {
     try {
       mkdirSync(lock);
-      writeFileSync(join(lock, 'pid'), String(process.pid));
+      writeFileSync(join(lock, 'owner'), token, { flag: 'wx' });
       break;
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
-      if (holderDead(lock)) {
-        try {
-          renameSync(lock, `${lock}.dead-${randomBytes(4).toString('hex')}`);
-        } catch (renameError) {
-          if (renameError.code !== 'ENOENT') throw renameError;
-        }
-        continue;
+      if (attempt >= tries) {
+        throw new ContextError('output is busy or has a stale `.lock` from a crashed build; remove it manually if no build is running.');
       }
-      if (attempt >= LOCK_TRIES) throw new ContextError('another graphify-context build holds this output; try again later.');
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_WAIT_MS);
     }
   }
   try {
     return fn();
   } finally {
-    rmSync(lock, { recursive: true, force: true });
+    if (readFileSync(join(lock, 'owner'), 'utf8') === token) rmSync(lock, { recursive: true });
   }
 }
 
@@ -432,15 +426,23 @@ function buildWith(ctx, tool) {
     const problem = graphProblem(bytes);
     if (problem) throw new ContextError(`${problem}; previous graph kept.`);
 
+    // Observe the generation's actual source after extraction, not the pre-extraction claim.
+    const observed = new Map(listFiles(join(gen, 'source')).map((name) => [name, readFileSync(join(gen, 'source', name))]));
+    if (fingerprint(observed) !== fingerprint(before.entries)) {
+      throw new ContextError('snapshot changed during extraction; previous graph kept.');
+    }
     const after = collect(root, mode, rev);
     if (keyFor(root, mode, after, tool).source !== key.source || after.commit !== before.commit) {
       throw new ContextError('source changed during the build; previous graph kept. Rebuild when work is quiet.');
     }
     const provenance = {
       ...key, builtAt: new Date().toISOString(), graphSha256: sha256(bytes),
-      snapshotSha256: fingerprint(before.entries), tree: before.tree, excludedSymlinksOrSubmodules: before.excluded,
+      snapshotSha256: fingerprint(observed), tree: before.tree, excludedSymlinksOrSubmodules: before.excluded,
     };
     writeFileSync(join(gen, 'provenance.json'), `${JSON.stringify(provenance, null, 2)}\n`);
+    if (lstatOrNull(join(out, 'current')) && !lstatOrNull(join(out, 'current')).isSymbolicLink()) {
+      throw new ContextError('`current` is not a symlink; refusing to replace it.');
+    }
     const tmpLink = join(out, `current.${randomBytes(4).toString('hex')}`);
     symlinkSync(name, tmpLink);
     renameSync(tmpLink, join(out, 'current'));
@@ -451,37 +453,24 @@ function buildWith(ctx, tool) {
   }
 }
 
-function prune(out, keepDir) {
-  for (const entry of readdirSync(out)) {
-    const full = join(out, entry);
-    if (GEN.test(entry) && full !== keepDir && lstatOrNull(full)?.isDirectory()) rmSync(full, { recursive: true, force: true });
+export function ensure(args, { force = false } = {}) {
+  const ctx = { ...prepare(args), mode: args.mode, rev: args.rev };
+  if (!force) {
+    const first = withTool(ctx, (tool) => inspectWith(ctx, tool));
+    if (first.status === 'fresh') return first;
   }
-}
-
-export function build(args) {
-  const ctx = { ...prepare(args), mode: args.mode, rev: args.rev };
-  ensureOutputDir(ctx.out);
-  return withLock(ctx.out, () => withTool(ctx, (tool) => {
-    const result = buildWith(ctx, tool);
-    prune(ctx.out, result.gen);
-    return result;
-  }));
-}
-
-export function ensure(args) {
-  const ctx = { ...prepare(args), mode: args.mode, rev: args.rev };
-  const first = withTool(ctx, (tool) => inspectWith(ctx, tool));
-  if (first.status === 'fresh') return first;
   ensureOutputDir(ctx.out);
   // Re-check under the lock so overlapping callers reuse a generation that just became fresh.
-  return withLock(ctx.out, () => withTool(ctx, (tool) => {
-    const again = inspectWith(ctx, tool);
-    if (again.status === 'fresh') return again;
-    const result = buildWith(ctx, tool);
-    prune(ctx.out, result.gen);
-    return result;
+  return withLock(ctx.out, args.lockTries ?? LOCK_TRIES, () => withTool(ctx, (tool) => {
+    if (!force) {
+      const again = inspectWith(ctx, tool);
+      if (again.status === 'fresh') return again;
+    }
+    return buildWith(ctx, tool);
   }));
 }
+
+export const build = (args) => ensure(args, { force: true });
 
 // ---- CLI ----------------------------------------------------------------------------------
 

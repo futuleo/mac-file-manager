@@ -214,7 +214,7 @@ test('overlapping builds are serialized and publish a matching graph and provena
   const provenance = JSON.parse(readFileSync(join(gen, 'provenance.json'), 'utf8'));
   const graph = readFileSync(join(gen, 'graph', 'graphify-out', 'graph.json'));
   assert.equal(provenance.graphSha256, execFileSync('shasum', ['-a', '256'], { input: graph }).toString().split(' ')[0]);
-  assert.equal(generations(out).length, 1);
+  assert.ok(generations(out).length >= 1);
   assert.equal(existsSync(join(out, '.lock')), false);
   const winner = JSON.parse(graph.toString()).nodes[0].id === 'A' ? slowA : toolB;
   assert.equal(inspect(args(repo, out, winner)).status, 'fresh');
@@ -312,3 +312,131 @@ test('live graphify smoke on an owned fixture in a credential- and settings-free
     assert.match(main(['ensure', '--out', out], repo, env).line, /graph=built/);
     assert.match(main(['ensure', '--out', out], repo, env).line, /graph=fresh/);
   });
+
+test('control paths: symlink marker, foreign generations and stale locks are never written, deleted or reclaimed', (t) => {
+  const { dir, repo } = workspace(t);
+  const bin = fakeTool(dir);
+  const victim = join(dir, 'victim.txt');
+  writeFileSync(victim, 'keep');
+  const linked = join(dir, 'linked');
+  mkdirSync(linked);
+  symlinkSync(victim, join(linked, '.graphify-context'));
+  assert.throws(() => build(args(repo, linked, bin)), /non-regular/);
+  assert.equal(readFileSync(victim, 'utf8'), 'keep');
+
+  const owned = join(dir, 'owned');
+  build(args(repo, owned, bin));
+  const foreign = join(owned, 'gen-1234567890abcdef');
+  mkdirSync(foreign);
+  writeFileSync(join(foreign, 'keep.txt'), 'x');
+  writeFileSync(join(repo, 'a.ts'), 'export const a = 5;\n');
+  git(repo, 'commit', '-qam', 'two');
+  build(args(repo, owned, bin));
+  assert.equal(readFileSync(join(foreign, 'keep.txt'), 'utf8'), 'x');
+  assert.equal(generations(owned).length, 3);
+
+  mkdirSync(join(owned, '.lock'));
+  writeFileSync(join(owned, '.lock', 'owner'), 'someone else');
+  const before = current(owned);
+  assert.throws(() => ensure(args(repo, owned, bin, { lockTries: 1, mode: 'worktree' })), /busy or has a stale/);
+  assert.equal(readFileSync(join(owned, '.lock', 'owner'), 'utf8'), 'someone else');
+  assert.equal(current(owned), before);
+});
+
+test('crashed predecessor lock with simultaneous callers: nobody reclaims it', async (t) => {
+  const { dir, repo, out } = workspace(t);
+  const bin = fakeTool(dir);
+  build(args(repo, out, bin));
+  writeFileSync(join(repo, 'a.ts'), 'export const a = 8;\n');
+  git(repo, 'commit', '-qam', 'two');
+  const before = current(out);
+  mkdirSync(join(out, '.lock'));
+  writeFileSync(join(out, '.lock', 'pid'), '99999999');
+  const run = () => new Promise((resolveRun) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e',
+      `import { ensure } from ${JSON.stringify(`file://${helper}`)};
+       try { ensure({ cwd: ${JSON.stringify(repo)}, out: ${JSON.stringify(out)}, mode: 'committed', rev: 'HEAD', bin: ${JSON.stringify(bin)}, pathEnv: '', lockTries: 2 }); process.exit(0); }
+       catch (e) { console.error(e.message); process.exit(1); }`]);
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('close', (code) => resolveRun({ code, stderr }));
+  });
+  const results = await Promise.all([run(), run()]);
+  for (const { code, stderr } of results) {
+    assert.equal(code, 1);
+    assert.match(stderr, /stale/);
+  }
+  assert.ok(existsSync(join(out, '.lock', 'pid')));
+  assert.equal(current(out), before);
+  assert.ok(existsSync(join(before, 'source', 'a.ts')));
+});
+
+test('the generation snapshot is re-verified after extraction', (t) => {
+  const { dir, repo, out } = workspace(t);
+  build(args(repo, out, fakeTool(dir)));
+  const before = current(out);
+  writeFileSync(join(repo, 'a.ts'), 'export const a = 4;\n');
+  git(repo, 'commit', '-qam', 'two');
+  for (const body of ['echo tampered > "$2/a.ts"', 'rm -f "$2/a.ts"', 'echo extra > "$2/extra.ts"']) {
+    assert.throws(() => build(args(repo, out, fakeTool(dir, { name: 'mut', body }))), /snapshot changed during extraction/);
+    assert.equal(current(out), before);
+  }
+  assert.deepEqual(generations(out), [before.split('/').pop()]);
+});
+
+test('provenance must be well formed and always carry a verified graph hash', (t) => {
+  const { dir, repo, out } = workspace(t);
+  const a = args(repo, out, fakeTool(dir));
+  build(a);
+  const file = join(current(out), 'provenance.json');
+  const original = JSON.parse(readFileSync(file, 'utf8'));
+  const graph = join(current(out), 'graph', 'graphify-out', 'graph.json');
+  writeFileSync(graph, '{"nodes":[{"id":"z"}],"links":[]}');
+  for (const [field, value] of [['graphSha256', undefined], ['graphSha256', null], ['graphSha256', 5], ['graphSha256', 'abc'],
+    ['snapshotSha256', undefined], ['builtAt', 3], ['tree', null], ['excludedSymlinksOrSubmodules', 'x']]) {
+    writeFileSync(file, JSON.stringify({ ...original, [field]: value }));
+    assert.equal(inspect(a).status, 'stale', `${field}=${String(value)}`);
+  }
+  for (const raw of ['null', '[]', '"x"', '5']) {
+    writeFileSync(file, raw);
+    assert.equal(inspect(a).status, 'stale');
+  }
+  writeFileSync(file, JSON.stringify(original));
+  assert.match(inspect(a).reason, /changed since/);
+});
+
+test('missing, dangling or nonconforming current is classified and rebuilt safely', (t) => {
+  const { dir, repo, out } = workspace(t);
+  const a = args(repo, out, fakeTool(dir));
+  build(a);
+  rmSync(current(out), { recursive: true });
+  assert.match(inspect(a).reason, /generation is missing/);
+  assert.equal(ensure(a).status, 'built');
+  assert.equal(inspect(a).status, 'fresh');
+  rmSync(join(out, 'current'));
+  symlinkSync('/etc', join(out, 'current'));
+  assert.match(inspect(a).reason, /outside the generation layout/);
+  assert.equal(ensure(a).status, 'built');
+  rmSync(join(out, 'current'));
+  mkdirSync(join(out, 'current'));
+  assert.match(inspect(a).reason, /not a symlink/);
+  assert.throws(() => ensure(a), /not a symlink/);
+});
+
+test('old generations are retained, so protected old content cannot fail a later successful build', (t) => {
+  const { dir, repo, out } = workspace(t);
+  const a = args(repo, out, fakeTool(dir));
+  build(a);
+  const old = current(out);
+  chmodSync(join(old, 'source'), 0o500);
+  writeFileSync(join(repo, 'a.ts'), 'export const a = 6;\n');
+  git(repo, 'commit', '-qam', 'two');
+  try {
+    assert.equal(build(a).status, 'built');
+  } finally {
+    chmodSync(join(old, 'source'), 0o700);
+  }
+  assert.equal(generations(out).length, 2);
+  assert.notEqual(current(out), old);
+  assert.equal(inspect(a).status, 'fresh');
+});

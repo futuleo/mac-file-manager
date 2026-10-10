@@ -51,8 +51,11 @@ cd ASSIGNED_CHECKOUT && node ABS_HELPER_PATH status --out ABS_ARTIFACT_DIR [--re
 ```
 
 - `--out` is an absolute directory outside the worktree (symlinks resolved; it may not
-  contain the repository). It must be new, empty, or previously created by the helper; only
-  `gen-*`, `current` and `.lock` inside it are ever replaced.
+  contain the repository). It must be new, empty, or previously created by the helper
+  (regular-file marker). The helper never deletes anything in it except its own failed
+  staging; old `gen-*` generations are retained, so remove them manually when done.
+  A crashed build leaves `.lock`; callers fail with a "busy or stale lock" error and the
+  lock must be removed by hand (no automatic reclaim).
 - Default is a snapshot of the committed `REV` built from exact Git tree blobs (ignoring
   `export-ignore`), verified against the tree; symlinks and submodules are excluded and
   counted in provenance. `--worktree` snapshots files from disk (edits, additions,
@@ -61,8 +64,9 @@ cd ASSIGNED_CHECKOUT && node ABS_HELPER_PATH status --out ABS_ARTIFACT_DIR [--re
 - `ensure` reuses the graph only while commit/tree (or worktree fingerprint), graphify
   version, executable/package bytes and extraction settings match and `graph.json` is
   structurally valid; otherwise it rebuilds. Each build is staged in its own generation and
-  published atomically under a lock; any failure or mid-build source change keeps the
-  previous generation. `status` never builds (exit 2 missing/stale; exit 3 graphify not
+  published atomically under a lock; any failure, mid-build source change or snapshot
+  modification during extraction keeps the previous generation. Missing or malformed
+  `current`/provenance is reported stale and rebuilt by `ensure`. `status` never builds (exit 2 missing/stale; exit 3 graphify not
   installed, so use direct source search).
 - graphify is executed only if it resolves outside the indexed repository, with an empty
   owned HOME/config/cache and a bounded PATH; indexed source is never executed.
