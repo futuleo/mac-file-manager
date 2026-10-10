@@ -182,16 +182,18 @@ export interface ImplementedCommands {
   edit_action: { args: { action: "copy" | "cut" | "paste" | "selectAll" }; result: void };
   /**
    * Toggles the native macOS Quick Look panel of the calling window for 1-50 existing items.
+   * `seq` orders the window's toggle/sync calls (it must grow); a call superseded by a newer
+   * one changes nothing and reports the panel as it is.
    * Resolves true when the panel is now showing them and false when it was closed. Rejects with
    * `invalidInput`/`notFound`/`permissionDenied` (nothing is shown) or `unsupported` (no native panel).
    */
-  quick_look_toggle: { args: { ids: string[] }; result: boolean };
+  quick_look_toggle: { args: { seq: number; ids: string[] }; result: boolean };
   /**
    * Points an open panel at the current selection. A no-op (false) when this window is not
    * showing it; an empty selection closes it. A selection that can no longer be previewed closes
    * the panel and rejects with the same errors as `quick_look_toggle`.
    */
-  quick_look_sync: { args: { ids: string[] }; result: boolean };
+  quick_look_sync: { args: { seq: number; ids: string[] }; result: boolean };
 }
 
 /**

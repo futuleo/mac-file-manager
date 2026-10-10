@@ -183,9 +183,10 @@ fn start_directory_read<R: Runtime>(
 #[tauri::command]
 async fn quick_look_toggle<R: Runtime>(
     window: WebviewWindow<R>,
+    seq: u64,
     ids: Vec<String>,
 ) -> Result<bool, AppError> {
-    quick_look::toggle(&window, ids).await
+    quick_look::toggle(&window, seq, ids).await
 }
 
 /// Applies the current selection to a preview the calling window has open (no-op
@@ -193,9 +194,10 @@ async fn quick_look_toggle<R: Runtime>(
 #[tauri::command]
 async fn quick_look_sync<R: Runtime>(
     window: WebviewWindow<R>,
+    seq: u64,
     ids: Vec<String>,
 ) -> Result<bool, AppError> {
-    quick_look::sync(&window, ids).await
+    quick_look::sync(&window, seq, ids).await
 }
 
 /// Idempotent: cancelling a finished or unknown read is not an error.

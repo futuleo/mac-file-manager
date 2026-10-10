@@ -144,7 +144,11 @@ mod run {
                 .collect::<Vec<_>>()
                 .into()
         };
-        let args = |paths: &[&PathBuf]| serde_json::json!({ "ids": ids(paths) });
+        let seq = std::cell::Cell::new(1000u64);
+        let args = |paths: &[&PathBuf]| {
+            seq.set(seq.get() + 1);
+            serde_json::json!({ "seq": seq.get(), "ids": ids(paths) })
+        };
         let mut n = 0;
         let mut call = |window: &WebviewWindow<Wry>, cmd: &str, a: Value| {
             n += 1;
@@ -261,16 +265,68 @@ mod run {
             matches!(&r, Err(e) if e["category"] == "invalidInput") && !closed(&app).visible,
             &r,
         );
+        seq.set(seq.get() + 1);
         let r = call(
             &window,
             "quick_look_toggle",
-            serde_json::json!({ "ids": ["zz"] }),
+            serde_json::json!({ "seq": seq.get(), "ids": ["zz"] }),
         );
         report.check(
             "malformed id is invalidInput",
             matches!(&r, Err(e) if e["category"] == "invalidInput") && !closed(&app).visible,
             &r,
         );
+
+        // 5b. Ordering: a request that carries an older sequence number than one already
+        // accepted is superseded and must change nothing on the real panel.
+        call(&window, "quick_look_toggle", args(&[&text])).unwrap();
+        let newest = seq.get();
+        let before = snapshot(&app);
+        let r = call(
+            &window,
+            "quick_look_sync",
+            serde_json::json!({ "seq": newest - 1, "ids": ids(&[&pdf]) }),
+        );
+        let after_stale = snapshot(&app);
+        report.check(
+            "superseded (older seq) sync leaves the panel untouched",
+            r == Ok(true.into()) && after_stale.current_path == before.current_path,
+            &(&r, &after_stale),
+        );
+        let r = call(
+            &window,
+            "quick_look_toggle",
+            serde_json::json!({ "seq": newest - 2, "ids": [] }),
+        );
+        report.check(
+            "superseded toggle does not close the panel",
+            r == Ok(true.into()) && snapshot(&app).visible,
+            &r,
+        );
+        // Two syncs issued back-to-back without waiting: the newer selection must win.
+        let image_path = canonical(&text);
+        let both = format!(
+            "Promise.all([window.__TAURI_INTERNALS__.invoke('quick_look_sync',{}),window.__TAURI_INTERNALS__.invoke('quick_look_sync',{})]).then(()=>{{location.hash='#done'}},()=>{{location.hash='#done'}})",
+            serde_json::json!({ "seq": newest + 10, "ids": ids(&[&pdf]) }),
+            serde_json::json!({ "seq": newest + 11, "ids": ids(&[&text]) }),
+        );
+        window.eval(&both).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && snapshot(&app).current_path.as_deref() != Some(image_path.as_str())
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let end = snapshot(&app);
+        report.check(
+            "back-to-back syncs: the newest selection is what the panel shows",
+            end.current_path.as_deref() == Some(image_path.as_str()),
+            &end,
+        );
+        seq.set(newest + 20);
+        call(&window, "quick_look_toggle", args(&[])).unwrap();
+        let _ = closed(&app);
 
         // 6. Window close tears down the controller and the panel.
         call(&window, "quick_look_toggle", args(&[&text])).unwrap();

@@ -66,7 +66,9 @@ export default function App() {
   const rowsRef = useRef<FileEntry[]>([]);
   const [clipboard, setClipboard] = useState<Clipboard | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
-  const previewSerial = useRef(0);
+  // Starts at the clock so a reloaded page never sends numbers the backend already saw.
+  const previewSerial = useRef(Date.now());
+  const previewPending = useRef(false);
   const [nameState, setNameState] = useState<NameState | null>(null);
 
   // Reload only the tabs showing a changed folder; `reveal` selects an item in one tab.
@@ -299,10 +301,16 @@ export default function App() {
       return;
     }
     const serial = ++previewSerial.current;
-    call("quick_look_toggle", { ids }).then(
-      (open) => serial === previewSerial.current && setPreviewOpen(open),
+    previewPending.current = true;
+    call("quick_look_toggle", { seq: serial, ids }).then(
+      (open) => {
+        if (serial !== previewSerial.current) return;
+        previewPending.current = false;
+        setPreviewOpen(open);
+      },
       (reason) => {
         if (serial !== previewSerial.current) return;
+        previewPending.current = false;
         setPreviewOpen(false);
         dispatch({ type: "action-error", tabId: t.id, error: toAppError(reason, "preview the selection") });
       },
@@ -460,12 +468,16 @@ export default function App() {
 
   // While the panel is open it follows the active tab's selection (and its query); a
   // reply for an older selection is ignored, and an empty selection closes it.
-  const previewKey = previewOpen ? rows.filter((e) => selection.ids.has(e.id)).map((e) => e.id).join("\0") : "";
+  // A context change while an open is still pending also sends a sync: the backend then
+  // supersedes the pending open so it cannot show a stale selection.
+  const previewKey = rows.filter((e) => selection.ids.has(e.id)).map((e) => e.id).join("\0");
+  const previewContext = `${activeId}|${tab?.search?.key ?? ""}|${tab?.nav ?? ""}`;
   useEffect(() => {
-    if (!previewOpen) return;
+    if (!previewOpen && !previewPending.current) return;
     const tabId = activeId;
     const serial = ++previewSerial.current;
-    call("quick_look_sync", { ids: previewKey ? previewKey.split("\0") : [] }).then(
+    previewPending.current = false;
+    call("quick_look_sync", { seq: serial, ids: previewKey ? previewKey.split("\0") : [] }).then(
       (open) => serial === previewSerial.current && !open && setPreviewOpen(false),
       (reason) => {
         if (serial !== previewSerial.current) return;
@@ -473,7 +485,7 @@ export default function App() {
         if (tabId) dispatch({ type: "action-error", tabId, error: toAppError(reason, "preview the selection") });
       },
     );
-  }, [previewOpen, previewKey, activeId, tab?.search?.key]);
+  }, [previewOpen, previewKey, previewContext]);
 
   // Announce load outcomes for screen readers.
   const status = tab?.listing.status;
