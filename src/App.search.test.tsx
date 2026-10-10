@@ -1,7 +1,7 @@
 // MOCKED IPC: `invoke` and `listen` are in-memory fakes of the backend. These tests verify how
 // the UI starts, cancels and renders searches and keeps them per tab; they do not prove real
 // Spotlight results, native menu delivery or WebView behavior.
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { DIRECTORY_EVENT, MENU_EVENT, SEARCH_EVENT } from "./backend/contracts";
@@ -33,6 +33,8 @@ const dir = (path: string) => entry(path, { kind: "directory", size: null });
 const home = dir("/Users/me");
 const nested = entry("/Users/me/Docs/deep/report.txt");
 const deepDir = dir("/Users/me/Docs/deep");
+const direct = entry("/Users/me/report-direct.txt");
+const directRenamed = entry("/Users/me/budget-direct.txt");
 
 let reads: { readId: string; id: string }[] = [];
 let calls: { command: string; args: Record<string, unknown> }[] = [];
@@ -73,7 +75,8 @@ beforeEach(() => {
       case "start_directory_read":
         reads.push({ readId: args.readId as string, id: args.id as string });
         return undefined;
-      case "parent_directory": return deepDir;
+      case "parent_directory": return (args.id as string) === home.id ? null : args.id === direct.id || args.id === directRenamed.id ? home : deepDir;
+      case "rename_item": return args.id === direct.id ? directRenamed : entry(`/Users/me/Docs/deep/${args.newName as string}`);
       case "get_icon": throw new Error("no icon in tests");
       default: return undefined;
     }
@@ -195,5 +198,69 @@ describe("search UI (mocked IPC)", () => {
     fireEvent.click(screen.getByText("report.txt").closest('[role="row"]')!);
     menu("trash");
     await waitFor(() => expect(called("trash_items")[0]?.args).toMatchObject({ ids: [nested.id] }));
+  });
+
+  async function rename(row: string, name: string) {
+    fireEvent.click(screen.getByText(row).closest('[role="row"]')!);
+    menu("rename");
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText("Name"), { target: { value: name } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Rename" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  }
+
+  it("a descendant renamed so it no longer matches leaves the filename results, and its folder is refreshed", async () => {
+    await start();
+    const args = await search("report");
+    emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
+    const readsBefore = reads.length;
+    await rename("report.txt", "budget.txt");
+    expect(called("rename_item")[0]!.args).toEqual({ id: nested.id, newName: "budget.txt" });
+    expect(screen.queryByText("report.txt")).toBeNull();
+    expect(screen.queryByText("budget.txt")).toBeNull();
+    // The search is still the active one and was not restarted or cancelled.
+    expect(called("start_search").length).toBe(1);
+    expect(called("cancel_search").length).toBe(0);
+    // The old id disappearing later must not remove anything else or fail.
+    emitSearch({ type: "removed", searchId: args.searchId, ids: [nested.id] });
+    expect(box().value).toBe("report");
+    expect(called("parent_directory").some((c) => c.args.id === hex("/Users/me/Docs/deep/budget.txt"))).toBe(true);
+    expect(reads.length).toBe(readsBefore);
+  });
+
+  it("a descendant renamed to a still-matching name stays in the filename results", async () => {
+    await start();
+    const args = await search("report");
+    emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
+    await rename("report.txt", "Report-2.txt");
+    expect(screen.getByText("Report-2.txt")).toBeTruthy();
+    expect(screen.queryByText("report.txt")).toBeNull();
+  });
+
+  it("a direct child renamed to a non-match leaves the results but keeps the search and refreshes the folder", async () => {
+    await start();
+    const args = await search("report");
+    emitSearch({ type: "results", searchId: args.searchId, entries: [direct], skipped: 0 });
+    const readsBefore = reads.length;
+    await rename("report-direct.txt", "budget-direct.txt");
+    expect(screen.queryByText("report-direct.txt")).toBeNull();
+    expect(screen.queryByText("budget-direct.txt")).toBeNull();
+    // The folder behind the search was reloaded; the search survived that reload.
+    await waitFor(() => expect(reads.length).toBe(readsBefore + 1));
+    expect(called("start_search").length).toBe(1);
+    expect(called("cancel_search").length).toBe(0);
+    expect(box().value).toBe("report");
+    emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
+    expect(screen.getByText("report.txt")).toBeTruthy();
+  });
+
+  it("content-mode results keep a renamed item, whose text did not change", async () => {
+    await start();
+    fireEvent.change(screen.getByLabelText("Search by"), { target: { value: "content" } });
+    const args = await search("needle");
+    expect(args.mode).toBe("content");
+    emitSearch({ type: "results", searchId: args.searchId, entries: [nested], skipped: 0 });
+    await rename("report.txt", "budget.txt");
+    expect(screen.getByText("budget.txt")).toBeTruthy();
   });
 });

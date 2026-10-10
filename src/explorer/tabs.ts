@@ -63,7 +63,7 @@ export type TabAction =
   | { type: "navigate"; tabId: string; location: Location; reveal?: string | null; ifNav?: number }
   | { type: "back"; tabId: string }
   | { type: "forward"; tabId: string }
-  | { type: "reload"; tabId: string; reveal?: string | null }
+  | { type: "reload"; tabId: string; reveal?: string | null; keepSearch?: boolean }
   | { type: "entries"; tabId: string; nav: number; entries: FileEntry[]; failures: ItemFailure[] }
   | { type: "finished"; tabId: string; nav: number }
   | { type: "failed"; tabId: string; nav: number; error: AppError }
@@ -110,6 +110,11 @@ function restart(tab: Tab, history: hist.History, keepSelection: boolean): Tab {
     search: null,
   };
 }
+
+const fold = (text: string) => text.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
+
+/** Case- and diacritic-insensitive containment, like the native `CONTAINS[cd]` predicate. */
+export const nameMatches = (query: string, name: string) => fold(name).includes(fold(query));
 
 /** Applies a change to the tab's search only if the event still belongs to the live query. */
 function onSearch(state: TabsState, tabId: string, key: number, change: (s: TabSearch, tab: Tab) => Tab): TabsState {
@@ -165,9 +170,12 @@ export function tabsReducer(state: TabsState, action: TabAction): TabsState {
         hist.canGoForward(tab.history) ? restart(tab, hist.forward(tab.history), false) : tab,
       );
     case "reload":
-      return update(state, action.tabId, (tab) =>
-        hist.current(tab.history) ? { ...restart(tab, tab.history, true), reveal: action.reveal ?? null } : tab,
-      );
+      return update(state, action.tabId, (tab) => {
+        if (!hist.current(tab.history)) return tab;
+        const next = { ...restart(tab, tab.history, true), reveal: action.reveal ?? null };
+        // A search list survives a refresh of the folder underneath it.
+        return action.keepSearch ? { ...next, search: tab.search } : next;
+      });
     case "entries":
       return update(state, action.tabId, (tab) =>
         tab.nav !== action.nav || tab.listing.status !== "loading"
@@ -244,16 +252,18 @@ export function tabsReducer(state: TabsState, action: TabAction): TabsState {
       });
     case "search-replace":
       return onSearch(state, action.tabId, action.key, (s, tab) => {
+        // The renamed item is never added blindly: a filename search keeps it only if
+        // its new name still matches. Content does not change with a rename.
+        const keeps = s.mode === "content" || nameMatches(s.query, action.entry.name);
         const entries = s.entries.filter((e) => e.id !== action.removeId && e.id !== action.entry.id);
-        entries.push(action.entry);
+        if (keeps) entries.push(action.entry);
         const ids = new Set(tab.selection.ids);
         ids.delete(action.removeId);
-        ids.add(action.entry.id);
-        return {
-          ...tab,
-          search: { ...s, entries },
-          selection: { ids, anchor: action.entry.id, focus: action.entry.id },
-        };
+        if (keeps) ids.add(action.entry.id);
+        const selection = keeps
+          ? { ids, anchor: action.entry.id, focus: action.entry.id }
+          : prune({ ...tab.selection, ids }, entries);
+        return { ...tab, search: { ...s, entries }, selection };
       });
     case "search-removed":
       return onSearch(state, action.tabId, action.key, (s, tab) => {

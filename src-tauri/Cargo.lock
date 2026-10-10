@@ -1730,6 +1730,7 @@ name = "mac-file-manager"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "dispatch2",
  "libc",
  "objc2",
  "objc2-app-kit",

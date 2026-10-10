@@ -187,6 +187,39 @@ describe("tab search state", () => {
     expect(tabsReducer(s, { type: "search-results", tabId: "tab-9", key: 2, entries: [file("9")], skipped: 0 })).toBe(s);
   });
 
+  it("a rename never injects a non-matching item into a filename search", () => {
+    let s = start();
+    s = tabsReducer(s, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("1", "q-a"), file("2", "q-b")], skipped: 0 });
+    s = tabsReducer(s, { type: "select", tabId: "tab-1", selection: { ids: new Set(["2"]), anchor: "2", focus: "2" } });
+    const miss = tabsReducer(s, { type: "search-replace", tabId: "tab-1", key: 1, removeId: "2", entry: file("3", "budget") });
+    expect(miss.tabs[0]!.search!.entries.map((e) => e.id)).toEqual(["1"]);
+    expect(miss.tabs[0]!.selection.ids.size).toBe(0);
+    // A later removal of the old id cannot touch anything else.
+    const after = tabsReducer(miss, { type: "search-removed", tabId: "tab-1", key: 1, ids: ["2"] });
+    expect(after.tabs[0]!.search!.entries.map((e) => e.id)).toEqual(["1"]);
+    const hit = tabsReducer(s, { type: "search-replace", tabId: "tab-1", key: 1, removeId: "2", entry: file("3", "Q-é") });
+    expect(hit.tabs[0]!.search!.entries.map((e) => e.id)).toEqual(["1", "3"]);
+    expect([...hit.tabs[0]!.selection.ids]).toEqual(["3"]);
+    // Stale query keys are ignored.
+    expect(tabsReducer(s, { type: "search-replace", tabId: "tab-1", key: 9, removeId: "2", entry: file("3", "q") })).toBe(s);
+    // Content searches match by text, which a rename does not change.
+    let c = tabsReducer(initialTabsState, { type: "open", location: loc });
+    c = tabsReducer(c, { type: "search-start", tabId: "tab-1", query: "needle", mode: "content" });
+    c = tabsReducer(c, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("1", "old")], skipped: 0 });
+    c = tabsReducer(c, { type: "search-replace", tabId: "tab-1", key: 1, removeId: "1", entry: file("1", "new") });
+    expect(c.tabs[0]!.search!.entries.map((e) => e.name)).toEqual(["new"]);
+  });
+
+  it("refreshing the folder under a search keeps it only when asked", () => {
+    let s = start();
+    s = tabsReducer(s, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("1", "q")], skipped: 0 });
+    const kept = tabsReducer(s, { type: "reload", tabId: "tab-1", keepSearch: true }).tabs[0]!;
+    expect(kept.search?.key).toBe(1);
+    expect(kept.search?.entries.length).toBe(1);
+    expect(kept.listing.status).toBe("loading");
+    expect(tabsReducer(s, { type: "reload", tabId: "tab-1" }).tabs[0]!.search).toBeNull();
+  });
+
   it("navigation and reload end the search; removals prune selection", () => {
     let s = start();
     s = tabsReducer(s, { type: "search-results", tabId: "tab-1", key: 1, entries: [file("1"), file("2")], skipped: 0 });

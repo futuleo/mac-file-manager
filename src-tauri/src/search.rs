@@ -131,6 +131,10 @@ pub struct Session {
     stop: Arc<AtomicBool>,
     sink: Sink,
     tx: Mutex<Option<Sender<Msg>>>,
+    /// Runs once when the search ends on its own (result limit or failure), so the
+    /// owner can release the native query without waiting for another notification.
+    on_end: Box<dyn Fn() + Send + Sync>,
+    ended: AtomicBool,
 }
 
 impl Session {
@@ -140,6 +144,17 @@ impl Session {
         scope: PathBuf,
         limit: usize,
         sink: impl Fn(SearchEvent) + Send + Sync + 'static,
+    ) -> (Arc<Session>, Feed) {
+        Self::spawn_with(id, scope, limit, sink, || {})
+    }
+
+    /// Like `spawn`, with a hook for searches that end on their own.
+    pub fn spawn_with(
+        id: &str,
+        scope: PathBuf,
+        limit: usize,
+        sink: impl Fn(SearchEvent) + Send + Sync + 'static,
+        on_end: impl Fn() + Send + Sync + 'static,
     ) -> (Arc<Session>, Feed) {
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -152,6 +167,8 @@ impl Session {
             stop: stop.clone(),
             sink: Box::new(sink),
             tx: Mutex::new(Some(tx.clone())),
+            on_end: Box::new(on_end),
+            ended: AtomicBool::new(false),
         });
         let worker = session.clone();
         std::thread::spawn(move || worker.run(rx));
@@ -193,6 +210,15 @@ impl Session {
             error,
         });
         self.close(false);
+        self.end();
+    }
+
+    /// Worker-driven termination: runs the owner's release hook exactly once, outside
+    /// every lock, whether or not any further query notification arrives.
+    fn end(&self) {
+        if !self.ended.swap(true, Ordering::AcqRel) {
+            (self.on_end)();
+        }
     }
 
     fn in_scope(&self, path: &Path) -> bool {
@@ -276,6 +302,9 @@ impl Session {
                 search_id: self.id.clone(),
                 limit: self.limit as u64,
             });
+            // The limit is terminal: nothing more is delivered, so the session closes.
+            self.close(false);
+            self.end();
         }
         limited
     }
@@ -354,6 +383,7 @@ impl Searches {
 mod tests {
     use super::*;
     use crate::spike_fixture::Fixture;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
 
     type Events = Arc<Mutex<Vec<SearchEvent>>>;
@@ -604,6 +634,94 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(events.lock().unwrap().len(), 1);
+    }
+
+    fn ending_session(
+        scope: &Path,
+        limit: usize,
+    ) -> (Arc<Session>, Feed, Events, Arc<AtomicUsize>) {
+        let events: Events = Arc::default();
+        let sink = events.clone();
+        let ends = Arc::new(AtomicUsize::new(0));
+        let counter = ends.clone();
+        let (session, feed) = Session::spawn_with(
+            "s1",
+            scope.to_path_buf(),
+            limit,
+            move |e| sink.lock().unwrap().push(e),
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        (session, feed, events, ends)
+    }
+
+    fn until(what: &str, done: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < Duration::from_secs(10), "{what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn reaching_the_limit_releases_the_query_without_further_notifications() {
+        let fx = Fixture::create_in(&std::env::temp_dir(), "mfm-search-limit-end").unwrap();
+        let scope = scope_of(&fx);
+        let paths: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                scope.join(
+                    fx.write(&format!("f{i}.txt"), "x")
+                        .unwrap()
+                        .file_name()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let (session, feed, events, ends) = ending_session(&scope, 2);
+        feed.paths(paths);
+        // No later query event is ever sent; the worker alone must end the search.
+        until("end hook", || ends.load(Ordering::SeqCst) == 1);
+        assert!(session.is_closed());
+        assert!(feed.should_stop());
+        let seen = events.lock().unwrap().clone();
+        assert!(matches!(seen.last(), Some(SearchEvent::Limited { .. })));
+        // Cancelling afterwards is a silent no-op and the hook never runs twice.
+        session.close(true);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(events.lock().unwrap().len(), seen.len());
+        assert_eq!(ends.load(Ordering::SeqCst), 1);
+        fx.cleanup().unwrap();
+    }
+
+    #[test]
+    fn failure_releases_the_query_without_further_notifications() {
+        let fx = Fixture::create_in(&std::env::temp_dir(), "mfm-search-fail-end").unwrap();
+        let scope = scope_of(&fx);
+        let (session, feed, events, ends) = ending_session(&scope, MAX_RESULTS);
+        feed.failed(AppError::new(ErrorCategory::Io, "search", None, "boom"));
+        until("end hook", || ends.load(Ordering::SeqCst) == 1);
+        assert!(session.is_closed());
+        // A start failure reported directly is also terminal, once.
+        session.fail(AppError::new(ErrorCategory::Io, "search", None, "again"));
+        assert_eq!(ends.load(Ordering::SeqCst), 1);
+        assert_eq!(events.lock().unwrap().len(), 1);
+
+        let (session, _feed, _events, ends) = ending_session(&scope, MAX_RESULTS);
+        session.fail(AppError::new(ErrorCategory::Io, "search", None, "start"));
+        assert_eq!(ends.load(Ordering::SeqCst), 1);
+        fx.cleanup().unwrap();
+    }
+
+    #[test]
+    fn cancellation_does_not_run_the_end_hook() {
+        let fx = Fixture::create_in(&std::env::temp_dir(), "mfm-search-cancel-end").unwrap();
+        let (session, _feed, _events, ends) = ending_session(&scope_of(&fx), MAX_RESULTS);
+        session.close(true);
+        session.close(true);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(ends.load(Ordering::SeqCst), 0);
+        fx.cleanup().unwrap();
     }
 
     #[test]

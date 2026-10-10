@@ -68,12 +68,12 @@ export default function App() {
   const [nameState, setNameState] = useState<NameState | null>(null);
 
   // Reload only the tabs showing a changed folder; `reveal` selects an item in one tab.
-  const reloadFolders = useCallback((folderIds: string[], reveal?: { tabId: string; id: string }) => {
+  const reloadFolders = useCallback((folderIds: string[], reveal?: { tabId: string; id: string }, keepSearch = false) => {
     const changed = new Set(folderIds);
     for (const t of stateRef.current.tabs) {
       const here = hist.current(t.history);
       if (here && changed.has(here.id)) {
-        dispatch({ type: "reload", tabId: t.id, reveal: reveal && reveal.tabId === t.id ? reveal.id : null });
+        dispatch({ type: "reload", tabId: t.id, reveal: reveal && reveal.tabId === t.id ? reveal.id : null, keepSearch });
       }
     }
   }, []);
@@ -361,10 +361,11 @@ export default function App() {
       (entry) => {
         setNameState(null);
         if (current.searchKey !== null) {
-          // The item stays where it was found: update the list and refresh its real folder.
+          // The renamed item stays in the list only if it still matches the query; its real
+          // folder is refreshed separately, and the search itself is kept.
           dispatch({ type: "search-replace", tabId: current.tabId, key: current.searchKey, removeId: current.entry.id, entry });
           call("parent_directory", { id: entry.id }).then(
-            (parent) => parent && reloadFolders([parent.id]),
+            (parent) => parent && reloadFolders([parent.id], undefined, true),
             () => undefined,
           );
         } else reloadFolders([current.folderId], { tabId: current.tabId, id: entry.id });

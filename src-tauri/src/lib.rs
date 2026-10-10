@@ -455,14 +455,18 @@ async fn start_search<R: Runtime>(
 
     searches.prune_closed();
     let label = window.label().to_string();
+    let registry = searches.inner().clone();
+    let end_app = app.clone();
+    let end_id = search_id.clone();
     let (session, feed) = searches.register(&search_id, || {
-        search::Session::spawn(
+        search::Session::spawn_with(
             &search_id,
             scope.clone(),
             search::MAX_RESULTS,
             move |event: SearchEvent| {
                 let _ = window.emit_to(label.as_str(), SEARCH_EVENT, event);
             },
+            move || end_search(&end_app, &registry, &end_id),
         )
     })?;
     begin_native_search(app, session, feed, search_id, scope, mode, query)
@@ -478,19 +482,13 @@ fn begin_native_search<R: Runtime>(
     mode: SearchMode,
     query: String,
 ) -> Result<(), AppError> {
-    let schedule: spotlight::Schedule = {
-        let app = app.clone();
-        Arc::new(move |work| {
-            let _ = app.run_on_main_thread(work);
-        })
-    };
     let queued = session.clone();
     app.run_on_main_thread(move || {
         // A search cancelled before this ran never creates a query.
         if queued.is_closed() {
             return;
         }
-        if let Err(error) = spotlight::start(&search_id, &scope, mode, &query, feed, schedule) {
+        if let Err(error) = spotlight::start(&search_id, &scope, mode, &query, feed) {
             queued.fail(error);
         }
     })
@@ -530,6 +528,19 @@ fn cancel_search<R: Runtime>(
     if let Some(session) = searches.take(&search_id) {
         release_search(&app, &session, search_id);
     }
+}
+
+/// A search ended on its own (result limit or failure): unregister it and release
+/// the native query now, independent of any further Spotlight notification.
+fn end_search<R: Runtime>(app: &tauri::AppHandle<R>, searches: &Searches, id: &str) {
+    searches.prune_closed();
+    #[cfg(target_os = "macos")]
+    {
+        let id = id.to_string();
+        let _ = app.run_on_main_thread(move || spotlight::stop(&id));
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (app, id);
 }
 
 fn release_search<R: Runtime>(app: &tauri::AppHandle<R>, session: &search::Session, id: String) {

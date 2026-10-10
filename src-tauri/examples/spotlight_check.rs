@@ -18,7 +18,7 @@ fn main() {
     use std::{
         collections::BTreeSet,
         path::PathBuf,
-        sync::{Arc, Mutex, mpsc},
+        sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
 
@@ -49,18 +49,11 @@ fn main() {
         .unwrap();
     println!("fixture: {} (owned, non-dot)", fixture.path().display());
 
-    // Work scheduled by the service runs on this (main) thread between run-loop turns.
-    let (tx, rx) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
-    let tx = Mutex::new(tx);
-    let schedule: spotlight::Schedule = Arc::new(move |work| {
-        let _ = tx.lock().unwrap().send(work);
-    });
+    // Continuations the service defers run on the main dispatch queue, which the
+    // run loop services between turns.
     let pump = |seconds: f64| {
         let date = NSDate::dateWithTimeIntervalSinceNow(seconds);
         NSRunLoop::currentRunLoop().runUntilDate(&date);
-        while let Ok(work) = rx.try_recv() {
-            work();
-        }
     };
 
     type Log = Arc<Mutex<Vec<(Duration, SearchEvent)>>>;
@@ -73,8 +66,7 @@ fn main() {
                 Session::spawn(id, fixture.path().to_path_buf(), 1000, move |e| {
                     sink.lock().unwrap().push((begun.elapsed(), e));
                 });
-            spotlight::start(id, fixture.path(), mode, query, feed, schedule.clone())
-                .expect("start");
+            spotlight::start(id, fixture.path(), mode, query, feed).expect("start");
             let found = |log: &Log| {
                 log.lock().unwrap().iter().any(|(_, e)| match e {
                     SearchEvent::Results { entries, .. } => entries.iter().any(|f| f.name == want),
@@ -167,7 +159,6 @@ fn main() {
         SearchMode::Filename,
         &name_token,
         feed,
-        schedule.clone(),
     )
     .expect("start");
     session.close(true);
