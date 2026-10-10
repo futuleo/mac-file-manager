@@ -69,8 +69,8 @@ export function auditPatch(patch) {
     if (line.startsWith('commit ')) { sha = line.slice(7, 19); fileNo = 0; }
     else if (line.startsWith('diff ')) {
       fileNo += 1;
-      if (hasPersonalEmail(line)) findings.push(`${sha}: path of changed file #${fileNo} contains a personal email`);
-    } else if (/^(?:rename|copy) (?:from|to) /.test(line) && hasPersonalEmail(line)) {
+      if (hasPersonalEmail(line, { assets: true })) findings.push(`${sha}: path of changed file #${fileNo} contains a personal email`);
+    } else if (/^(?:rename|copy) (?:from|to) /.test(line) && hasPersonalEmail(line, { assets: true })) {
       findings.push(`${sha}: path of changed file #${fileNo} contains a personal email`);
     } else {
       const hunk = line.match(/^@@+ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/);

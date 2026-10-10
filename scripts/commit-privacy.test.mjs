@@ -281,3 +281,18 @@ test('stale tracking ref at the sensitive tip does not hide a new-ref push', () 
     assert.equal(auditPushLines(`refs/heads/f ${head} refs/heads/f ${zero}\n`, r.dir).length, 1);
   } finally { r.done(); }
 });
+
+test('retina asset file paths are accepted, other email-like paths are not', () => {
+  const r = repo();
+  try {
+    const base = r.commit('a.txt', 'a');
+    mkdirSync(join(r.dir, 'icons'));
+    const head = r.commit('icons/icon@2x.svg', '<svg/>\n');
+    assert.deepEqual(auditRange([`${base}..${head}`], r.dir), []);
+    assert.equal(cli(['range', base, head], r.dir).code, 0);
+    const bad = r.commit(`${personal}.txt`, 'x');
+    const result = cli(['range', head, bad], r.dir);
+    assert.equal(result.code, 1);
+    assert.ok(!result.out.includes(personal));
+  } finally { r.done(); }
+});
